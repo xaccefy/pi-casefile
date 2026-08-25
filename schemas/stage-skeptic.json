@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Skeptic",
+  "description": "Adversarial disconfirmation verdict from the skeptic subagent. Runs between TRACE and VALIDATE for confidence == high (severity doesn't exist yet; it's assigned only after the PoC runs). The skeptic independently re-reads source — or re-probes live endpoints read-only — and tries to disprove the finding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["finding_id", "verdict", "reasoning", "evidence_reviewed"],
+  "properties": {
+    "finding_id": {
+      "type": "string",
+      "description": "Case ID of the finding under review"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["CONFIRMED", "DISPROVEN", "UNDETERMINED"],
+      "description": "CONFIRMED = skeptic found no concrete disproof after independent review. DISPROVEN = skeptic found it to be a false positive, overstated, or unreachable. UNDETERMINED = skeptic could not resolve the review and the finding must not advance to validation yet."
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "The skeptic's independent reasoning. Must cite real code (file:line) the skeptic actually read, not the auditor's summary."
+    },
+    "evidence_reviewed": {
+      "type": "array",
+      "description": "Source files, endpoints, or artifacts the skeptic independently reviewed to reach the verdict.",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "disconfirmation_attempt": {
+      "type": "string",
+      "description": "What the skeptic tried in order to disprove the finding (alternative paths, defenses, intended-behavior check, different attacker model). Required-strength: a concrete attempt, not 'could not disprove'."
+    },
+    "disproval_reason": {
+      "type": "string",
+      "enum": [
+        "unreachable",
+        "intended_behavior",
+        "duplicate",
+        "framework_protection",
+        "input_validation_blocks",
+        "requires_privilege_attacker_lacks",
+        "exploit_unreliable",
+        "insufficient_impact",
+        "environmental_issue",
+        "not_applicable",
+        "out_of_scope",
+        "test_artifact",
+        "no_attack_path",
+        "refuted"
+      ],
+      "description": "Why the finding is disproven (required when verdict is DISPROVEN)"
+    },
+    "uncertainty_reason": {
+      "type": "string",
+      "description": "Why the skeptic could not resolve the review (required when verdict is UNDETERMINED); validation must wait for re-dispatch or main-agent resolution."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "DISPROVEN" } } },
+      "then": { "required": ["disproval_reason"] }
+    },
+    {
+      "if": { "properties": { "verdict": { "const": "CONFIRMED" } } },
+      "then": { "required": ["disconfirmation_attempt"] }
+    },
+    {
+      "if": { "properties": { "verdict": { "const": "UNDETERMINED" } } },
+      "then": { "required": ["uncertainty_reason"] }
+    }
+  ]
+}

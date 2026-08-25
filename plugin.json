@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pi-casefile",
+  "version": "0.9.4",
+  "description": "Offensive security case ledger for Pi Agent — evidence tracking with machine-verified PoC gates.",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "casefile", "security", "bug-bounty", "pentest", "ctf"]
+}

@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Finding",
+  "description": "A vulnerability finding produced by the auditor/hunter stage. Must pass validation before proof work.",
+  "type": "object",
+  "required": ["vuln_class", "sink", "entry_point", "confidence", "evidence"],
+  "oneOf": [
+    { "required": ["file", "line"], "description": "Source/white-box target locator" },
+    { "required": ["endpoint"], "description": "Live black-box target locator" }
+  ],
+  "properties": {
+    "vuln_class": {
+      "type": "string",
+      "description": "Agent-chosen vulnerability class/type. Use the most precise useful label for this target, for example: sqli, graphql-bola, oauth-callback-open-redirect, template-injection."
+    },
+    "file": {
+      "type": "string",
+      "description": "Source file path relative to repo root. REQUIRED for source/white-box targets; omit for live black-box targets (use endpoint instead)."
+    },
+    "line": {
+      "type": "integer",
+      "description": "Line number of the sink. REQUIRED with file for source targets; omit for live targets.",
+      "minimum": 1
+    },
+    "endpoint": {
+      "type": "string",
+      "description": "Live target locator: method + path + parameter (e.g. 'GET /api/users?id='). REQUIRED for live black-box targets where file/line are unavailable."
+    },
+    "sink": { "type": "string", "description": "The dangerous function or operation" },
+    "entry_point": {
+      "type": "string",
+      "description": "How attacker input reaches this code path"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "How sure the auditor is this is exploitable"
+    },
+    "evidence": {
+      "type": "string",
+      "description": "Structural call path and reasoning, entry → sink. Include relevant code snippets."
+    },
+    "attacker_model": {
+      "type": "string",
+      "description": "Who the attacker is (unauth internet, low-priv user, etc.)"
+    },
+    "subsystem": {
+      "type": "string",
+      "description": "Which subsystem of the target this affects"
+    }
+  },
+  "additionalProperties": false
+}
