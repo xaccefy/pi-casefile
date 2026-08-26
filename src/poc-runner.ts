@@ -727,6 +727,16 @@ export function runPoc(pocPath: string, options?: PocRunOptions): PocRun {
 
   const opts: PocRunOptions = options ?? {};
 
+  // Operator/test-harness escape: PI_POC_FORCE_LOCAL=1 together with the
+  // operator opt-in PI_POC_ALLOW_LOCAL=1 runs EVERY PoC on the host, skipping
+  // Docker entirely — including default (network:"none") and OOB runs, not just
+  // local:true ones. Both flags are operator env (never agent-supplied), so this
+  // cannot be triggered by a finding. Without them, execution falls through to
+  // the isolated sandbox as before.
+  if (process.env.PI_POC_FORCE_LOCAL === "1" && process.env[LOCAL_EXEC_ENV] === "1") {
+    return runLocal(normalized, language, opts.env);
+  }
+
   // Host execution is gated by the OPERATOR, never by an agent-supplied flag.
   // `local: true` means "network access needed":
   //   1. Prefer a host-network Docker sandbox (isolation retained).
