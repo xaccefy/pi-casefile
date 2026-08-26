@@ -1,14 +1,14 @@
 /**
  * Casefile — offensive security case tracker for Pi.
  *
- * Tools: CaseAdd, CaseUpdate, PromoteFinding, ConfirmFinding, EvidenceAdd, CoverageAdd, CoverageReport, ChainSuggest, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, PipelineSubmit, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
+ * Tools: CaseAdd, CaseUpdate, PromoteFinding, ConfirmFinding, EvidenceAdd, CoverageAdd, CoverageReport, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
  * Command: /casefile — interactive dashboard
- * Event: before_agent_start — injects cyber workflow once per session, refreshes the active case list per prompt
+ * Event: before_agent_start — injects the recon workflow once per session, refreshes the active case list per prompt
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { type TSchema, Type } from "typebox";
@@ -28,8 +28,6 @@ import {
 import {
   addCaseResult,
   addEvidenceItemResult,
-  addObjectiveResult,
-  addPrimitiveResult,
   applyConfirmationResult,
   assertPromotable,
   type CaseConfidence,
@@ -46,8 +44,6 @@ import {
   type CoverageScope,
   countCases,
   coverageSummary,
-  deleteObjectiveResult,
-  deletePrimitiveResult,
   EVIDENCE_ROLE_VALUES,
   type EvidenceItem,
   type EvidenceRole,
@@ -56,23 +52,13 @@ import {
   formatCases,
   getCaseById,
   getCasefilePath,
-  getObjectiveById,
-  getPrimitiveById,
   LINK_KIND_VALUES,
   linkCasesResult,
-  linkObjectiveCase,
-  linkPrimitiveResult,
-  listObjectives,
-  listPrimitives,
   type MainAgentVerification,
-  OBJECTIVE_PHASE_VALUES,
-  OBJECTIVE_STATUS_VALUES,
   type OobVerification,
   type PendingConfirmation,
   type PocEvidenceRun,
-  PRIMITIVE_KIND_VALUES,
   PRIORITY_VALUES,
-  type PrimitiveKind,
   readActiveCases,
   readCasefile,
   recordCoverageResult,
@@ -82,12 +68,9 @@ import {
   searchCases,
   storePendingConfirmation,
   unlinkCasesResult,
-  unlinkObjectiveCase,
-  unlinkPrimitiveResult,
   updateCaseResult,
-  updateObjectiveStatusResult,
 } from "./ledger.ts";
-import { suggestChainsAsync, writeCaseContextAsync } from "./ledger-worker.ts";
+import { writeCaseContext } from "./ledger.ts";
 import {
   type OobOracleConfig,
   type ProvisionedCallback,
@@ -95,7 +78,6 @@ import {
   readOobOracleConfig,
   verifyOobDifferential,
 } from "./oob-oracle.ts";
-import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
 import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
   detectWorkspaceRoot,
@@ -111,11 +93,7 @@ import {
   scratchpad_write,
   setScratchpadRoot,
 } from "./scratchpad.ts";
-import {
-  STATIC_CYBER_WORKFLOW,
-  STATIC_CYBER_WORKFLOW_LITE,
-  STATIC_CYBER_WORKFLOW_OMP,
-} from "./workflow.ts";
+import { STATIC_RECON_WORKFLOW, STATIC_RECON_WORKFLOW_OMP } from "./workflow.ts";
 
 // ── Schemas ───────────────────────────────────────────────────────────
 
@@ -158,6 +136,12 @@ const CommonFields = {
   disconfirmation: Type.Optional(
     Type.String({
       description: "Documented attempt to disprove the finding before confirmation",
+    }),
+  ),
+  invariant: Type.Optional(
+    Type.String({
+      description:
+        "The security invariant this finding violates — the rule broken (e.g. 'a user cannot read another user's orders'). Confirmation checks the invariant is actually violated, not just that a request returned 200.",
     }),
   ),
 };
@@ -390,7 +374,7 @@ const UnlinkSchema = Type.Object(
 
 // ── Tool: Scratchpad ─────────────────────────────────────────────────
 //
-// The scratchpad is the pipeline's crash-recoverable artifact store.
+// The scratchpad is a crash-recoverable working-notes store for a run.
 // The casefile owns state transitions; the scratchpad owns artifacts
 // (recon maps, trace outputs, verification logs). Resume re-reads
 // artifacts; it does not re-run completed phases (idempotent).
@@ -630,10 +614,8 @@ class CasefileDashboard {
 }
 
 // ── Context injection ─────────────────────────────────────────────────
-// Injected once per user prompt via before_agent_start (not every tool turn).
-// Skills are opt-in; this keeps bounty discipline always present even with an empty ledger.
-
-// workflow.ts contains the full text
+// The active case list is injected via before_agent_start (once per user
+// prompt, not every tool turn) so open cases stay visible in context.
 
 function sanitizeContextText(v?: string, max = 160): string | undefined {
   // biome-ignore lint/suspicious/noControlCharactersInRegex: strip C0 controls from untrusted case text
@@ -719,99 +701,28 @@ function buildCaseListContext(records: CaseRecord[]): string {
 
 /**
  * Detect the extension host. OMP is a fork of Pi: both load the same
- * `pi`-manifest extensions, but subagent dispatch differs (pi-subagents'
+ * `pi`-manifest extensions, but recon subagent dispatch differs (pi-subagents'
  * `subagent({workflowScript})` vs OMP's native `task`). The entry script path
- * carries the host package: `@oh-my-pi/pi-coding-agent/dist/cli.js` under OMP,
- * `@earendil-works/pi-coding-agent` under Pi.
+ * carries the host package.
  */
-export function detectHost(): "omp" | "pi" {
+function detectHost(): "omp" | "pi" {
   const argv = process.argv.join(" ");
   if (argv.includes("@oh-my-pi")) return "omp";
   return "pi";
 }
 
 /**
- * Builds the per-prompt injection. The cyber workflow is session-scope data —
- * it never changes — so the caller passes includeWorkflow=true exactly once
- * per session; re-injecting it on every prompt is pure token cost. The active
- * case list DOES change as cases are added, so it is refreshed every prompt.
- *
- * mode selects the workflow text: "lite" injects the single-agent workflow
- * (no subagent dispatch), "swarm" gets the full subagent pipeline,
- * rendered for the host's dispatch convention (pi-subagents vs OMP task).
+ * Per-prompt injection. The recon workflow is session-scope guidance — it never
+ * changes — so it is injected once (first prompt, includeWorkflow=true). The
+ * active case list DOES change as cases are added, so it refreshes every prompt.
+ * The workflow text is rendered for the host's dispatch convention.
  */
-function buildAgentInjection(
-  active: CaseRecord[],
-  includeWorkflow: boolean,
-  mode: XpMode = "swarm",
-): string {
+function buildAgentInjection(active: CaseRecord[], includeWorkflow: boolean): string {
   const caseList = buildCaseListContext(active);
   if (!includeWorkflow) return caseList;
-  const workflow =
-    mode === "lite"
-      ? STATIC_CYBER_WORKFLOW_LITE
-      : detectHost() === "omp"
-        ? STATIC_CYBER_WORKFLOW_OMP
-        : STATIC_CYBER_WORKFLOW;
+  const workflow = detectHost() === "omp" ? STATIC_RECON_WORKFLOW_OMP : STATIC_RECON_WORKFLOW;
   // Workflow FIRST for prominence, then case list as reference data.
   return caseList ? `${workflow}\n\n${caseList}` : workflow;
-}
-
-// ── XP (offensive / exploit) mode toggle ─────────────────────────────
-// Casefile historically injected the cyber workflow into every prompt.
-// For normal dev work that is just noise, so XP mode defaults OFF. Enable
-// swarm for the bounded multi-agent variant, or lite for the single-agent
-// attacker discipline. Toggle with /xp (off <-> swarm), or set explicitly with
-// /xp on|lite|swarm|off. "on" means the default enabled SWARM mode; use "lite"
-// for no subagent dispatch.
-// Override per-session with PI_XP_MODE.
-// Pure helpers exported for unit tests.
-
-export const XP_MODE_ENV = "PI_XP_MODE";
-export type XpMode = "swarm" | "off" | "lite";
-
-export function getXpModeStatePath(): string {
-  return join(dirname(getCasefilePath()), "xp-mode");
-}
-
-export function readXpMode(
-  envValue: string | undefined = process.env[XP_MODE_ENV],
-  statePath: string = getXpModeStatePath(),
-): XpMode {
-  const env = (envValue ?? "").trim().toLowerCase();
-  if (env === "swarm") return "swarm";
-  if (env === "on" || env === "1" || env === "true") return "swarm";
-  if (env === "lite") return "lite";
-  if (env === "off" || env === "0" || env === "false") return "off";
-  try {
-    if (existsSync(statePath)) {
-      const v = readFileSync(statePath, "utf8").trim().toLowerCase();
-      if (v === "swarm" || v === "on") return "swarm";
-      if (v === "lite") return "lite";
-      if (v === "off") return "off";
-    }
-  } catch {
-    // ignore and fall through to default
-  }
-  return "off";
-}
-
-export function writeXpMode(state: XpMode, statePath: string = getXpModeStatePath()): void {
-  try {
-    writeFileSync(statePath, state, "utf8");
-  } catch {
-    // best-effort; env var can still override at runtime
-  }
-}
-
-export function parseXpModeArg(args: string, current: XpMode): XpMode {
-  const arg = (args ?? "").trim().toLowerCase();
-  if (arg === "swarm") return "swarm";
-  if (arg === "on") return "swarm";
-  if (arg === "off") return "off";
-  if (arg === "lite") return "lite";
-  // Bare /xp is the low-ceremony path: toggle the default XP workflow on/off.
-  return current === "off" ? "swarm" : "off";
 }
 
 // ── Main extension ────────────────────────────────────────────────────
@@ -870,6 +781,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use CaseAdd for a new security lead. New cases start as status='hypothesis' or 'investigating' — promote later with CaseUpdate.",
       "disproveIf is REQUIRED on CaseAdd: name the falsification conditions (what would disprove this hypothesis). A hypothesis that can't say what kills it isn't a hypothesis yet.",
+      "Declare the invariant: the security rule the finding would violate (e.g. 'a user cannot read another user's orders'). Confirmation checks the invariant is actually broken, not just that a request succeeded — a reproduction without a violated invariant is a mechanism, not a vulnerability.",
       "Check the injected case list or CaseList/CaseSearch first. Do not add a duplicate for the same title/scope.",
       "CaseAdd rejects exact and NEAR-duplicates (same target + overlapping title, e.g. parallel-subagent re-phrasings). A near-duplicate result → continue the existing case ID via CaseUpdate, don't create a new one.",
       "confirmed/reported only via their gates: proof in poc + PromoteFinding for confirmed; CaseContext + report for reported.",
@@ -1175,352 +1087,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
       const details = result.details as { summary?: { items?: CoverageItem[] } } | undefined;
       const n = details?.summary?.items?.length ?? 0;
       return new Text(theme.fg("success", `✓ ${n} coverage cell(s)`), 0, 0);
-    },
-  });
-
-  // ── Tool: Primitive (attack material) ──
-
-  const PrimitiveSchema = Type.Object(
-    {
-      action: Type.String({
-        enum: ["add", "list", "get", "link", "unlink", "delete"],
-        description: "Primitive management action.",
-      }),
-      kind: Type.Optional(
-        Type.String({
-          enum: [...PRIMITIVE_KIND_VALUES],
-          description:
-            "Primitive kind: credential | session | token | account | endpoint | param | payload.",
-        }),
-      ),
-      label: Type.Optional(
-        Type.String({
-          description: "Human-readable name (e.g. 'admin API token from debug dump').",
-        }),
-      ),
-      value_ref: Type.Optional(
-        Type.String({
-          description:
-            "REFERENCE to the value — env var name, file path, or hash prefix. NEVER store the live secret itself.",
-        }),
-      ),
-      capabilities: Type.Optional(
-        Type.String({
-          description: "What the primitive grants ('admin API access', 'victim session').",
-        }),
-      ),
-      notes: Type.Optional(Type.String({ description: "Free-form notes." })),
-      id: Type.Optional(Type.String({ description: "Primitive ID (for get/link/unlink/delete)." })),
-      case_id: Type.Optional(
-        Type.String({ description: "Case to link/unlink, or case filter for list." }),
-      ),
-      case_ids: Type.Optional(
-        Type.Array(Type.String(), { description: "Cases to attach on add (producer first)." }),
-      ),
-    },
-    { additionalProperties: false },
-  );
-
-  registerCaseTool({
-    name: "Primitive",
-    label: "Attack Primitive",
-    description:
-      "Track attack primitives — credentials, sessions, tokens, accounts, endpoints, params, payloads discovered during testing — as first-class objects linked to cases. Primitives are the AMMUNITION layer: a leaked token found by one case becomes reusable material for another case's escalation, and ChainSuggest pairs primitive-producing cases with cases whose surface accepts them. Store REFERENCES (env var, file, hash), never live secrets.",
-    promptSnippet: "Track attack material (credentials/tokens/sessions/endpoints) linked to cases",
-    promptGuidelines: [
-      "Record a primitive the moment testing produces reusable material: leaked API key, valid victim session, working payload, undocumented admin endpoint.",
-      "value_ref must be a REFERENCE (env var name, evidence file, sha256 prefix) — never paste live secrets into the ledger.",
-      "Link the producing case AND every case the primitive was used against — that usage graph is what ChainSuggest mines for escalation paths.",
-      "Before hunting escalation, run ChainSuggest on your case: primitive_use suggestions pair your material with other cases' attack surface.",
-    ],
-    parameters: PrimitiveSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const action = params.action as string;
-      switch (action) {
-        case "add": {
-          if (!params.kind) throw new Error("add requires kind");
-          if (!params.label) throw new Error("add requires label");
-          const primitive = addPrimitiveResult({
-            kind: params.kind as PrimitiveKind,
-            label: params.label as string,
-            valueRef: params.value_ref as string | undefined,
-            capabilities: params.capabilities as string | undefined,
-            notes: params.notes as string | undefined,
-            caseIds: params.case_ids as string[] | undefined,
-          });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Primitive recorded: [${primitive.kind}] ${primitive.label} (${primitive.id})${primitive.caseIds.length ? ` linked to: ${primitive.caseIds.join(", ")}` : ""}`,
-              },
-            ],
-            details: { primitive },
-          };
-        }
-        case "list": {
-          const items = listPrimitives({
-            kind: params.kind as string | undefined,
-            caseId: params.case_id as string | undefined,
-          });
-          const text =
-            items.length === 0
-              ? "No primitives recorded."
-              : items
-                  .map(
-                    (p) =>
-                      `[${p.kind}] ${p.label} (${p.id})${p.capabilities ? ` — ${p.capabilities}` : ""}${p.caseIds.length ? ` · cases: ${p.caseIds.join(", ")}` : ""}`,
-                  )
-                  .join("\n");
-          return { content: [{ type: "text", text }], details: { primitives: items } };
-        }
-        case "get": {
-          const primitive = getPrimitiveById(params.id as string);
-          if (!primitive) throw new Error(`Primitive not found: ${params.id}`);
-          return {
-            content: [{ type: "text", text: JSON.stringify(primitive, null, 2) }],
-            details: { primitive },
-          };
-        }
-        case "link": {
-          if (!params.id || !params.case_id) throw new Error("link requires id and case_id");
-          const primitive = linkPrimitiveResult(params.id as string, params.case_id as string);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Linked ${primitive.id} to ${params.case_id}. Cases: ${primitive.caseIds.join(", ")}`,
-              },
-            ],
-            details: { primitive },
-          };
-        }
-        case "unlink": {
-          if (!params.id || !params.case_id) throw new Error("unlink requires id and case_id");
-          const primitive = unlinkPrimitiveResult(params.id as string, params.case_id as string);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Unlinked ${primitive.id} from ${params.case_id}. Remaining cases: ${primitive.caseIds.join(", ") || "none"}`,
-              },
-            ],
-            details: { primitive },
-          };
-        }
-        case "delete": {
-          if (!params.id) throw new Error("delete requires id");
-          const deleted = deletePrimitiveResult(params.id as string);
-          if (!deleted) throw new Error(`Primitive not found: ${params.id}`);
-          return {
-            content: [{ type: "text", text: `Deleted primitive ${params.id}.` }],
-            details: { deleted },
-          };
-        }
-        default:
-          throw new Error(`Unknown action: ${action}`);
-      }
-    },
-
-    renderCall(args, theme) {
-      return callLine(
-        theme,
-        "Primitive",
-        `${(args.action as string) ?? ""} ${(args.label as string) ?? (args.id as string) ?? ""}`,
-      );
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as
-        | { primitive?: { kind?: string; label?: string } }
-        | undefined;
-      if (details?.primitive?.label) {
-        return new Text(
-          theme.fg("success", "✓ ") +
-            theme.fg("dim", `[${details.primitive.kind}] `) +
-            truncateToWidth(details.primitive.label, 50),
-          0,
-          0,
-        );
-      }
-      return new Text(theme.fg("success", "✓ primitive"), 0, 0);
-    },
-  });
-
-  // ── Tool: Objective (kill-chain OPPLAN-lite) ──
-
-  const ObjectiveSchema = Type.Object(
-    {
-      action: Type.String({
-        enum: ["add", "list", "get", "status", "link-case", "unlink-case", "delete"],
-        description: "Objective management action.",
-      }),
-      title: Type.Optional(Type.String({ description: "Objective title (for add)." })),
-      phase: Type.Optional(
-        Type.String({
-          enum: [...OBJECTIVE_PHASE_VALUES],
-          description: "Kill-chain phase: recon | initial-access | post-exploit | exfiltration.",
-        }),
-      ),
-      status: Type.Optional(
-        Type.String({
-          enum: [...OBJECTIVE_STATUS_VALUES],
-          description: "Target status for the status action (state-machine enforced).",
-        }),
-      ),
-      acceptance: Type.Optional(
-        Type.String({ description: "What proves this objective achieved." }),
-      ),
-      depends_on: Type.Optional(
-        Type.Array(Type.String(), { description: "Objective IDs that must complete first." }),
-      ),
-      blocked_reason: Type.Optional(
-        Type.String({ description: "Required when blocking an objective." }),
-      ),
-      id: Type.Optional(Type.String({ description: "Objective ID." })),
-      case_id: Type.Optional(Type.String({ description: "Case to link/unlink." })),
-    },
-    { additionalProperties: false },
-  );
-
-  registerCaseTool({
-    name: "Objective",
-    label: "Engagement Objective",
-    description:
-      "Track kill-chain objectives with phases (recon, initial-access, post-exploit, exfiltration), a pending → in-progress → completed/blocked/cancelled state machine, and dependencies that are enforced in code — an objective cannot start until its dependencies completed. Cases attach as evidence of work. This is the engagement's OPPLAN-lite: it answers 'am I winning?' while cases answer 'is this bug real?'.",
-    promptSnippet: "Manage kill-chain objectives with enforced dependencies and phases",
-    promptGuidelines: [
-      "Define objectives BEFORE hunting: 'OBJ: obtain admin session', 'OBJ: read cross-tenant data' — then hunt toward them instead of collecting unrelated bugs.",
-      "Dependencies are enforced: exploitation cannot start before recon completes. Mark progress honestly via the status action.",
-      "Link every case that serves an objective — the /casefile dashboard shows kill-chain progress from these links.",
-      "Blocked objectives require blocked_reason; a blocked objective is knowledge, not failure.",
-    ],
-    parameters: ObjectiveSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const action = params.action as string;
-      switch (action) {
-        case "add": {
-          if (!params.title) throw new Error("add requires title");
-          if (!params.phase) throw new Error("add requires phase");
-          const objective = addObjectiveResult({
-            title: params.title as string,
-            phase: params.phase as string,
-            acceptance: params.acceptance as string | undefined,
-            dependsOn: params.depends_on as string[] | undefined,
-          });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Objective created: [${objective.phase}] ${objective.title} (${objective.id}, ${objective.status})`,
-              },
-            ],
-            details: { objective },
-          };
-        }
-        case "list": {
-          const items = listObjectives({
-            phase: params.phase as string | undefined,
-            status: params.status as string | undefined,
-          });
-          const text =
-            items.length === 0
-              ? "No objectives defined."
-              : items
-                  .map(
-                    (o) =>
-                      `[${o.status}] (${o.phase}) ${o.title} (${o.id})${o.dependsOn.length ? ` · deps: ${o.dependsOn.join(",")}` : ""}${o.caseIds.length ? ` · cases: ${o.caseIds.join(",")}` : ""}`,
-                  )
-                  .join("\n");
-          return { content: [{ type: "text", text }], details: { objectives: items } };
-        }
-        case "get": {
-          const objective = getObjectiveById(params.id as string);
-          if (!objective) throw new Error(`Objective not found: ${params.id}`);
-          return {
-            content: [{ type: "text", text: JSON.stringify(objective, null, 2) }],
-            details: { objective },
-          };
-        }
-        case "status": {
-          if (!params.id || !params.status) throw new Error("status requires id and status");
-          const objective = updateObjectiveStatusResult(
-            params.id as string,
-            params.status as string,
-            params.blocked_reason as string | undefined,
-          );
-          return {
-            content: [
-              {
-                type: "text",
-                text: `${objective.id} -> ${objective.status}${objective.blockedReason ? ` (${objective.blockedReason})` : ""}`,
-              },
-            ],
-            details: { objective },
-          };
-        }
-        case "link-case": {
-          if (!params.id || !params.case_id) throw new Error("link-case requires id and case_id");
-          const objective = linkObjectiveCase(params.id as string, params.case_id as string);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Linked case ${params.case_id} to ${objective.id}. Cases: ${objective.caseIds.join(", ")}`,
-              },
-            ],
-            details: { objective },
-          };
-        }
-        case "unlink-case": {
-          if (!params.id || !params.case_id) throw new Error("unlink-case requires id and case_id");
-          const objective = unlinkObjectiveCase(params.id as string, params.case_id as string);
-          return {
-            content: [
-              { type: "text", text: `Unlinked case ${params.case_id} from ${objective.id}.` },
-            ],
-            details: { objective },
-          };
-        }
-        case "delete": {
-          if (!params.id) throw new Error("delete requires id");
-          if (!deleteObjectiveResult(params.id as string)) {
-            throw new Error(`Objective not found: ${params.id}`);
-          }
-          return {
-            content: [{ type: "text", text: `Deleted objective ${params.id}.` }],
-            details: { deleted: true },
-          };
-        }
-        default:
-          throw new Error(`Unknown action: ${action}`);
-      }
-    },
-
-    renderCall(args, theme) {
-      return callLine(
-        theme,
-        "Objective",
-        `${(args.action as string) ?? ""} ${(args.title as string) ?? (args.id as string) ?? ""}`,
-      );
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as
-        | { objective?: { status?: string; title?: string } }
-        | undefined;
-      if (details?.objective?.title) {
-        return new Text(
-          theme.fg("success", "✓ ") +
-            theme.fg("dim", `[${details.objective.status}] `) +
-            truncateToWidth(details.objective.title, 50),
-          0,
-          0,
-        );
-      }
-      return new Text(theme.fg("success", "✓ objective"), 0, 0);
     },
   });
 
@@ -1895,15 +1461,18 @@ export default function casefileExtension(pi: ExtensionAPI) {
       name: "ConfirmFinding",
       label: "Main-Agent Confirmation",
       description:
-        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after personally reviewing the machine bundle. On CONFIRMED, this tool performs a fresh harness-owned target/control replay; the verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, a canary assessment, and the still-valid PromoteFinding bundle. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. NOT_CONFIRMED records the review and keeps the case investigating.",
-      promptSnippet: "Main agent: independently review and commit or refuse PoC confirmation",
+        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after independently re-testing the finding. On CONFIRMED, this tool performs a fresh harness-owned target/control replay; the verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, a canary assessment, and the still-valid PromoteFinding bundle. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. Three verdicts: CONFIRMED (you reproduced real impact), NOT_CONFIRMED (you POSITIVELY disproved it), INCONCLUSIVE (you could neither reproduce nor disprove — the case is preserved for manual review, never dropped).",
+      promptSnippet: "Main agent: independently re-test, then commit or refuse PoC confirmation",
       promptGuidelines: [
         "Run only in the main/coordinator agent after PromoteFinding returns. Do not dispatch a worker to decide or author this verdict.",
-        "Personally inspect the PoC and preserved evidence and try a concrete disconfirmation before deciding. ConfirmFinding itself re-sends the immutable verify request against target and operator-approved control so phase 2 has a harness-owned transcript.",
-        "CONFIRMED requires differential: 'target_only', re_execution_note, and disconfirmation_attempt (the main agent's failed disproof). A verdict missing any of these is rejected.",
-        "Set canary_assessment='verified' when the immutable request declared a canary; otherwise set not_applicable and explain why a reflection canary is not meaningful for this exploit class.",
-        "NOT_CONFIRMED is final for that attempt — the case stays investigating with the main agent's reasoning recorded. A fresh PromoteFinding run is required for another attempt.",
-        "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding + ConfirmFinding.",
+        "Verify with DISBELIEF: assume the finding is a false positive until your OWN re-test proves otherwise. Reproduce the exact observable yourself from the primary evidence (not the hunter's narrative), with a negative/baseline control — a difference you cannot tie to the control is not proof. ConfirmFinding itself re-sends the immutable verify request against target and operator-approved control so phase 2 has a harness-owned transcript.",
+        "Provenance: the proof must exercise THIS finding's own mechanism. Evidence obtained through a DIFFERENT bug (e.g. 'SQLi' proven by dumping the DB via an RCE) does not confirm it — that is INCONCLUSIVE at best.",
+        "Kill the cheapest benign explanation: is this the technology's intended behavior? Did the attacker supply the 'secret' themselves (circular)? Is the claimed C/I/A impact actually demonstrated?",
+        "Want a second pair of eyes? Dispatch a read-only skeptic subagent to re-test — it CANNOT confirm (only the main agent commits). You review its verdict and commit it here.",
+        "CONFIRMED requires differential: 'target_only', re_execution_note, and disconfirmation_attempt (your failed disproof). A verdict missing any of these is rejected. Set canary_assessment='verified' when the immutable request declared a canary; otherwise not_applicable with a reason.",
+        "NOT_CONFIRMED means you POSITIVELY disproved it (by-design, circular, mislabeled, no impact). Never mark NOT_CONFIRMED merely because you could not reproduce it.",
+        "INCONCLUSIVE when you could neither reproduce nor disprove (needs auth, a second account, specific state, timing, or a blind/stored trigger you cannot observe). The case stays investigating and is preserved for manual review — dropping a real finding is worse than keeping an unproven one.",
+        "Every verdict consumes the attempt: a fresh PromoteFinding run is required to try again. Never CaseUpdate status='confirmed' directly — always PromoteFinding + ConfirmFinding.",
       ],
       parameters: ConfirmSchema,
 
@@ -2006,7 +1575,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
               text: promoted
                 ? `Main agent CONFIRMED. Case promoted:
 ${formatCaseDetail(record)}`
-                : `Main agent NOT_CONFIRMED — case stays investigating (attempt recorded):
+                : parsedVerdict.verdict.verdict === "INCONCLUSIVE"
+                  ? `Main agent INCONCLUSIVE — case stays investigating, preserved for manual review (not disproved):
+${formatCaseDetail(record)}`
+                  : `Main agent NOT_CONFIRMED — case stays investigating (attempt recorded):
 ${formatCaseDetail(record)}`,
             },
           ],
@@ -2244,67 +1816,6 @@ ${formatCaseDetail(record)}`,
     },
   });
 
-  // ── Tool: ChainSuggest ──
-
-  const ChainSuggestSchema = Type.Object(
-    {
-      case_id: Type.Optional(
-        Type.String({
-          description:
-            "Optional: scope suggestions to this case and its linked cases. Omit to scan all non-terminal cases.",
-        }),
-      ),
-    },
-    { additionalProperties: false },
-  );
-
-  registerCaseTool({
-    name: "ChainSuggest",
-    label: "Suggest Exploit Chains",
-    description:
-      "Scan non-terminal cases for exploitable chains (credential+endpoint→ATO, open-redirect+OAuth→token theft, XSS+state-changing→CSRF bypass, IDOR+user-data→mass leak, SSTI→RCE, race+payment→financial, info-disclosure+SSRF). Returns ranked candidates with confidence and a suggested link kind — the agent decides whether to CaseLink them or open an escalation case. Catches chain combinations the model may have missed.",
-    promptSnippet: "Find missed exploit-chain combinations",
-    promptGuidelines: [
-      "Run ChainSuggest before concluding an engagement — low-severity findings that chain into high-impact (ATO, token theft, mass leak) are the ones triage cares about.",
-      "A suggestion is a HYPOTHESIS to verify, not a finding: test the chained behavior on the live target before linking or promoting anything.",
-      "Chain a suggested pair with CaseLink (suggested kind) or open a new escalation case with status=hypothesis.",
-    ],
-    parameters: ChainSuggestSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const suggestions = await suggestChainsAsync(
-        (params.case_id as string | undefined) ?? undefined,
-      );
-      const lines: string[] = [
-        suggestions.length
-          ? `${suggestions.length} chain candidate(s):`
-          : "No chain candidates found across non-terminal cases.",
-      ];
-      for (const s of suggestions) {
-        const pair = s.targetId
-          ? `${s.sourceId} (${s.sourceTitle}) + ${s.targetId} (${s.targetTitle ?? ""})`
-          : `${s.sourceId} (${s.sourceTitle})`;
-        lines.push(
-          `\n[${s.pattern}] conf ${s.confidence}% — ${pair}\n  ${s.rationale}${s.suggestedKind ? `\n  suggested link kind: ${s.suggestedKind}` : ""}`,
-        );
-      }
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: { suggestions },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "ChainSuggest", (args.case_id as string) ?? "all");
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as { suggestions?: { length: number } } | undefined;
-      const n = details?.suggestions?.length ?? 0;
-      return new Text(theme.fg(n ? "accent" : "dim", `${n} chain candidate(s)`), 0, 0);
-    },
-  });
-
   // ── Tool: CaseContext ──
 
   registerCaseTool({
@@ -2320,7 +1831,7 @@ ${formatCaseDetail(record)}`,
     parameters: IdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { path, contextPath, record } = await writeCaseContextAsync(params.id as string);
+      const { path, contextPath, record } = writeCaseContext(params.id as string);
       return {
         content: [
           {
@@ -2343,97 +1854,6 @@ ${formatCaseDetail(record)}`,
         0,
         0,
       );
-    },
-  });
-
-  // ── Command: /xp (toggle offensive XP mode) ──
-
-  pi.registerCommand("xp", {
-    description:
-      "Toggle casefile XP (offensive) mode. Bare /xp and /xp on select SWARM, the bounded multi-agent workflow. LITE keeps XP single-agent. OFF (default) keeps context quiet for normal dev work. Usage: /xp [on|lite|swarm|off]",
-    handler: async (args, ctx) => {
-      const next = parseXpModeArg(args ?? "", readXpMode());
-      writeXpMode(next);
-      // Re-enabling after a mid-session /xp off must re-inject the workflow
-      // on the next prompt — otherwise workflowInjected (module-level, set on
-      // first enable) stays true and the workflow never comes back until the
-      // process restarts.
-      if (next !== "off") workflowInjected = false;
-      ctx.ui.notify(
-        `Casefile XP mode: ${next.toUpperCase()} (takes effect on the next prompt)`,
-        next === "off" ? "warning" : "info",
-      );
-    },
-  });
-
-  // ── Tool: PipelineSubmit ──
-
-  registerCaseTool({
-    name: "PipelineSubmit",
-    label: "Submit Stage Output",
-    description:
-      "Submit a pipeline stage's output (hunt, trace, skeptic, validate, chain, report) through the validation gate. Validates required fields against the stage spec (mirrors schemas/*.json), applies the deterministic pre-filter (test-path and file-existence filters on hunt findings, trivial dedup by file+class+line), and counts repair attempts (max 2, then rejected). A stage cannot advance on an invalid output — submit fixed output until accepted.",
-    promptSnippet: "Validate and submit a pipeline stage's output",
-    promptGuidelines: [
-      "Every delegated stage output and every main-agent VALIDATE/REPORT output must go through PipelineSubmit before the next stage starts — do not eyeball schemas.",
-      "verdict repair → fix the listed fields and re-submit the same output; budget is 2 attempts per finding, then rejected.",
-      "Skeptic: unparseable/schema-invalid = no verdict (repair/re-dispatch); only schema-valid DISPROVEN kills, and schema-valid UNDETERMINED blocks validation.",
-      "Tracer crash/invalid output = no trace verdict; repair or re-dispatch.",
-      'Only schema-valid trace_result: "UNREACHABLE" blocks advancement as a proven unreachable path; schema-valid UNDETERMINED blocks validation until resolved.',
-      "Test-path findings and hallucinated files are rejected by the pre-filter, not repairable — the finding itself is noise.",
-    ],
-    parameters: Type.Object(
-      {
-        run_id: Type.String({
-          description: "Pipeline run identifier (same as the scratchpad run_id)",
-        }),
-        stage: Type.String({
-          enum: [...SUBMIT_STAGES],
-          description: "Pipeline stage: hunt | trace | skeptic | validate | chain | report",
-        }),
-        output: Type.Union([Type.String(), Type.Object({}, { additionalProperties: true })], {
-          description: "The stage output as a JSON object or JSON string (code fences tolerated)",
-        }),
-      },
-      { additionalProperties: false },
-    ),
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const result = pipeline_submit(
-        params.run_id as string,
-        params.stage as SubmitStage,
-        params.output,
-      );
-      const statusLine =
-        result.verdict === "accepted"
-          ? `ACCEPTED (${params.stage}) — artifact: ${result.artifact}`
-          : result.verdict === "repair"
-            ? `REPAIR (attempt ${result.repair_attempt}/2) — fix these and re-submit:\n  - ${result.errors.join("\n  - ")}`
-            : `REJECTED — ${result.errors.join("\n")}`;
-      if (result.verdict !== "accepted") throw new Error(statusLine);
-      return {
-        content: [{ type: "text", text: statusLine }],
-        details: result as unknown as Record<string, unknown>,
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "PipelineSubmit", `${args.stage ?? ""}`);
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as { verdict?: string; repair_attempt?: number } | undefined;
-      if (details?.verdict === "accepted") {
-        return new Text(theme.fg("success", "✓ PipelineSubmit accepted"), 0, 0);
-      }
-      if (details?.verdict === "repair") {
-        return new Text(
-          theme.fg("warning", `↷ PipelineSubmit repair ${details.repair_attempt}/2`),
-          0,
-          0,
-        );
-      }
-      return new Text(theme.fg("error", "✗ PipelineSubmit rejected"), 0, 0);
     },
   });
 
@@ -2800,22 +2220,19 @@ ${formatCaseDetail(record)}`,
     }
   });
 
-  // ── Event: Inject cyber workflow into system prompt ──
-  // XP (offensive) mode is OFF by default so normal dev work stays quiet.
-  // When enabled, the cyber workflow is injected ONCE per session (first
-  // prompt); the active case list refreshes every prompt because it changes
-  // as cases are added. Injecting into event.systemPrompt (not as a
-  // conversation message) avoids session bloat from repeated message entries.
+  // ── Event: Inject the recon workflow + active-case list into the prompt ──
+  // The recon workflow is injected ONCE per session (first prompt); the active
+  // case list refreshes every prompt because it changes as cases are added.
+  // Injecting into event.systemPrompt (not as a conversation message) avoids
+  // session bloat from repeated message entries.
   let workflowInjected = false;
 
   pi.on("before_agent_start", async (event) => {
-    const mode = readXpMode();
-    if (mode === "off") return;
     // Skip subagent child processes: pi-subagents runs each child in its own
     // pi process (PI_SUBAGENT_CHILD=1) with this extension loaded. Injecting
     // the workflow + entire active-case ledger into every child dispatch is a
-    // token multiplier (N subagents × workflow + growing case list per turn) —
-    // workers get what they need via their task and tool guidelines.
+    // token multiplier (N children × workflow + growing case list per turn) —
+    // recon workers get what they need via their task, not the coordinator's.
     if (isSubagentProcess()) return;
 
     const includeWorkflow = !workflowInjected;
@@ -2824,15 +2241,13 @@ ${formatCaseDetail(record)}`,
     try {
       active = readActiveCases();
     } catch {
-      // No database yet — still inject workflow.
+      // No database yet — still inject the workflow.
     }
 
-    const injection = buildAgentInjection(active, includeWorkflow, mode);
+    const injection = buildAgentInjection(active, includeWorkflow);
     if (!injection) return; // workflow already injected, no active cases
     workflowInjected = true;
 
-    // Inject workflow FIRST (before skills) so the attacker mindset is
-    // prominent, not buried at the end of a long system prompt.
     return {
       systemPrompt: `${injection}\n\n${event.systemPrompt ?? ""}`,
     };

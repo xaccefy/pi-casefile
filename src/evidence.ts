@@ -387,7 +387,10 @@ export function normalizeEvidence(e: PoCEvidence): string {
 
 // ── Main-agent confirmation verdict ─────────────────────────────────
 
-export const CONFIRM_VERDICT_VALUES = ["CONFIRMED", "NOT_CONFIRMED"] as const;
+// INCONCLUSIVE is the fail-safe verdict: the reviewer could neither reproduce
+// the finding nor positively disprove it. It preserves the case for manual
+// review instead of dropping it. NOT_CONFIRMED means positively disproved.
+export const CONFIRM_VERDICT_VALUES = ["CONFIRMED", "NOT_CONFIRMED", "INCONCLUSIVE"] as const;
 export type ConfirmVerdict = (typeof CONFIRM_VERDICT_VALUES)[number];
 
 export const CONFIRM_DIFFERENTIAL_VALUES = [
@@ -518,6 +521,3 @@ export function validateMainAgentVerdict(
 
 /** @deprecated Compatibility alias for integrations built before phase 2 became main-agent-only. */
 export type ConfirmerVerdict = MainAgentVerdict;
-
-/** @deprecated Use validateMainAgentVerdict. */
-export const validateConfirmerVerdict = validateMainAgentVerdict;

@@ -7,11 +7,7 @@ import { setHarnessFetchForTest } from "../src/harness-verify.ts";
 import { getCaseById, setCasefilePath } from "../src/ledger.ts";
 import { setOobOracleFetchForTest } from "../src/oob-oracle.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
-import {
-  STATIC_CYBER_WORKFLOW,
-  STATIC_CYBER_WORKFLOW_LITE,
-  STATIC_CYBER_WORKFLOW_OMP,
-} from "../src/workflow.ts";
+import { STATIC_RECON_WORKFLOW, STATIC_RECON_WORKFLOW_OMP } from "../src/workflow.ts";
 
 mock.module("@earendil-works/pi-ai", () => ({
   StringEnum: (values: readonly string[]) => ({ enum: values }),
@@ -235,14 +231,10 @@ describe("casefile extension", () => {
       "CaseSearch",
       "CaseUnlink",
       "CaseUpdate",
-      "ChainSuggest",
       "ConfirmFinding",
       "CoverageAdd",
       "CoverageReport",
       "EvidenceAdd",
-      "Objective",
-      "PipelineSubmit",
-      "Primitive",
       "PromoteFinding",
       "ScratchpadCheckpoint",
       "ScratchpadClear",
@@ -252,7 +244,7 @@ describe("casefile extension", () => {
       "ScratchpadResume",
       "ScratchpadWrite",
     ]);
-    expect([...pi.commands.keys()].sort()).toEqual(["casefile", "xp"]);
+    expect([...pi.commands.keys()].sort()).toEqual(["casefile"]);
     expect(pi.events.has("session_start")).toBe(true);
     expect(pi.events.has("before_agent_start")).toBe(true);
     expect(pi.events.has("tool_result")).toBe(true);
@@ -1180,30 +1172,6 @@ describe("casefile extension", () => {
     expect(report.content[0].text).toContain("example-app");
   });
 
-  test("ChainSuggest surfaces cross-case chains", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-
-    const cred = await addCase(pi, {
-      title: "Leaked API key",
-      status: "investigating",
-      confidence: "medium",
-      target: "example-app",
-      evidence: "key in public repo",
-    });
-    await addCase(pi, {
-      title: "Admin login endpoint",
-      status: "investigating",
-      confidence: "medium",
-      target: "example-app",
-      evidence: "login accepts credentials",
-    });
-
-    const suggestions = await executeTool(pi, "ChainSuggest", { case_id: cred.details.record.id });
-    expect(suggestions.content[0].text).toContain("credential_endpoint");
-    expect(suggestions.details.suggestions.length).toBeGreaterThan(0);
-  });
-
   test("PromoteFinding rejects evidence not bound to this run (nonce mismatch)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
@@ -1347,154 +1315,73 @@ describe("casefile extension", () => {
     );
   });
 
-  test("XP mode is off by default: before_agent_start injects nothing", async () => {
-    const previous = process.env.PI_XP_MODE;
-    delete process.env.PI_XP_MODE;
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
+  test("first prompt: injects the recon workflow even with an empty ledger", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
 
-      const handler = pi.events.get("before_agent_start")?.[0];
-      expect(handler).toBeFunction();
-      const result = await handler();
-      expect(result).toBeUndefined();
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
-    }
+    const handler = pi.events.get("before_agent_start")?.[0];
+    expect(handler).toBeFunction();
+    const result = await handler({ systemPrompt: "existing prompt" });
+    expect(result.systemPrompt).toContain("existing prompt");
+    expect(result.systemPrompt).toContain("# Recon Workflow");
+    expect(result.systemPrompt).not.toContain("<casefile_context>");
   });
 
-  test("XP mode lite: injects the single-agent workflow, not the full pipeline", async () => {
-    const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "lite";
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
-
-      const handler = pi.events.get("before_agent_start")?.[0];
-      expect(handler).toBeFunction();
-      const event = { systemPrompt: "existing prompt" };
-      const result = await handler(event);
-
-      expect(result.systemPrompt).toContain("existing prompt");
-      expect(result.systemPrompt).toContain("# Cyber Workflow — LITE (Single-Agent)");
-      expect(result.systemPrompt).toContain("Do NOT dispatch subagents");
-      expect(result.systemPrompt).not.toContain("Evidence-First Doctrine");
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
-    }
-  });
-
-  test("XP mode swarm: injects cyber workflow even with an empty ledger", async () => {
-    const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "swarm";
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
-
-      const handler = pi.events.get("before_agent_start")?.[0];
-      expect(handler).toBeFunction();
-      const event = { systemPrompt: "existing prompt" };
-      const result = await handler(event);
-
-      expect(result.systemPrompt).toContain("existing prompt");
-      expect(result.systemPrompt).toContain("# Cyber Workflow");
-      expect(result.systemPrompt).toContain("Evidence-First Doctrine");
-      expect(result.systemPrompt).not.toContain("<casefile_context>");
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
-    }
-  });
-
-  test("XP mode swarm + subagent child process: before_agent_start injects nothing", async () => {
-    const previousXp = process.env.PI_XP_MODE;
+  test("subagent child process: before_agent_start injects nothing even with active cases", async () => {
     const previousChild = process.env.PI_SUBAGENT_CHILD;
-    process.env.PI_XP_MODE = "swarm";
-    process.env.PI_SUBAGENT_CHILD = "1";
+    delete process.env.PI_SUBAGENT_CHILD;
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
+      await addCase(pi, { title: "Active lead", status: "hypothesis" });
 
+      process.env.PI_SUBAGENT_CHILD = "1";
       const handler = pi.events.get("before_agent_start")?.[0];
       expect(handler).toBeFunction();
       const result = await handler({ systemPrompt: "existing prompt" });
       expect(result).toBeUndefined();
     } finally {
-      if (previousXp === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previousXp;
       if (previousChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
       else process.env.PI_SUBAGENT_CHILD = previousChild;
     }
   });
 
-  test("XP swarm toggle mid-session re-injects the workflow", async () => {
-    const previous = process.env.PI_XP_MODE;
-    delete process.env.PI_XP_MODE;
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
+  test("recon workflow injected once per session; case list refreshes per prompt", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
 
-      const handler = pi.events.get("before_agent_start")?.[0];
-      const xpCmd = pi.commands.get("xp");
-      const notify = () => undefined;
+    const handler = pi.events.get("before_agent_start")?.[0];
+    expect(handler).toBeFunction();
 
-      // Default off: nothing injected.
-      expect(await handler({ systemPrompt: "p" })).toBeUndefined();
+    // First prompt: recon workflow injected.
+    const first = await handler({ systemPrompt: "p" });
+    expect(first.systemPrompt).toContain("# Recon Workflow");
 
-      // /xp swarm → workflow injected.
-      await xpCmd.handler("swarm", { ui: { notify } });
-      const on1 = await handler({ systemPrompt: "p" });
-      expect(on1.systemPrompt).toContain("# Cyber Workflow");
+    // Second prompt, still-empty ledger: workflow already injected, no cases → nothing.
+    expect(await handler({ systemPrompt: "p" })).toBeUndefined();
 
-      // /xp off → nothing injected.
-      await xpCmd.handler("off", { ui: { notify } });
-      expect(await handler({ systemPrompt: "p" })).toBeUndefined();
-
-      // /xp swarm again → workflow must come back (regression: workflowInjected
-      // stayed true from the first enable, so re-enabling silently never
-      // re-injected the workflow until process restart).
-      await xpCmd.handler("swarm", { ui: { notify } });
-      const on2 = await handler({ systemPrompt: "p" });
-      expect(on2.systemPrompt).toContain("# Cyber Workflow");
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
-    }
+    // After a case appears: case list refreshes, workflow NOT re-injected.
+    await addCase(pi, { title: "Mid session lead", status: "hypothesis" });
+    const third = await handler({ systemPrompt: "p" });
+    expect(third.systemPrompt).toContain("<casefile_context>");
+    expect(third.systemPrompt).toContain("Mid session lead");
+    expect(third.systemPrompt).not.toContain("# Recon Workflow");
   });
 
-  test("XP mode swarm: workflow injected once per session, case list refreshes per prompt", async () => {
-    const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "swarm";
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
-
-      const handler = pi.events.get("before_agent_start")?.[0];
-      expect(handler).toBeFunction();
-
-      // First prompt: workflow included.
-      const first = await handler({ systemPrompt: "p" });
-      expect(first.systemPrompt).toContain("# Cyber Workflow");
-
-      // Second prompt with empty ledger: no workflow, no injection at all.
-      const second = await handler({ systemPrompt: "p" });
-      expect(second).toBeUndefined();
-
-      // Third prompt after a case appears: case list refreshes, workflow NOT re-injected.
-      await addCase(pi, {
-        title: "Mid session lead",
-        status: "hypothesis",
-      });
-      const third = await handler({ systemPrompt: "p" });
-      expect(third.systemPrompt).toContain("<casefile_context>");
-      expect(third.systemPrompt).toContain("Mid session lead");
-      expect(third.systemPrompt).not.toContain("# Cyber Workflow");
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
+  test("recon workflow: recon-only scope, subagent dispatch, no hunt/validate pipeline", () => {
+    for (const wf of [STATIC_RECON_WORKFLOW, STATIC_RECON_WORKFLOW_OMP]) {
+      expect(wf).toContain("# Recon Workflow");
+      expect(wf).toContain("attack-surface map");
+      expect(wf).toContain("agent: 'recon'");
+      // PoC confirmation gate is referenced as unchanged, not orchestrated here.
+      expect(wf).toContain("PromoteFinding → ConfirmFinding");
+      // The removed swarm pipeline stages must not reappear.
+      expect(wf).not.toContain("PipelineSubmit");
+      expect(wf).not.toContain("HUNT");
     }
+    // Host-specific dispatch mechanics differ.
+    expect(STATIC_RECON_WORKFLOW).toContain("subagent({ workflowScript");
+    expect(STATIC_RECON_WORKFLOW_OMP).toContain("task({ context: 'fresh'");
   });
 
   test("XP mode swarm: injects only active cases into before_agent_start context", async () => {
@@ -1591,8 +1478,6 @@ describe("casefile extension", () => {
       expect(result.systemPrompt).not.toContain("This should not be injected");
       expect(result.systemPrompt).not.toContain("Killed duplicate");
       expect(result.systemPrompt).not.toContain("Already reported");
-      // Workflow still rides along with the case list.
-      expect(result.systemPrompt).toContain("# Cyber Workflow");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;
@@ -1670,107 +1555,6 @@ describe("casefile extension", () => {
       const firstRowStart = ctx.indexOf("  - case_");
       const firstRow = ctx.slice(firstRowStart, ctx.indexOf("\n", firstRowStart));
       expect(firstRow).toContain(p0Id);
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
-    }
-  });
-
-  test("workflow constants carry the new gates and the renamed tool (no stale CaseReport)", () => {
-    // The injected text is the operative contract; dropping a gate or the
-    // renamed tool silently passes the injection tests, so pin the markers.
-    expect(STATIC_CYBER_WORKFLOW).toContain("Design & Runtime Check");
-    expect(STATIC_CYBER_WORKFLOW).toContain("CaseContext");
-    expect(STATIC_CYBER_WORKFLOW).not.toContain("CaseReport");
-    expect(STATIC_CYBER_WORKFLOW).toContain("only auditor (HUNT rounds), tracer");
-    expect(STATIC_CYBER_WORKFLOW).toContain("VALIDATE (you, inline)");
-    expect(STATIC_CYBER_WORKFLOW).toContain("REPORT (you, inline)");
-    expect(STATIC_CYBER_WORKFLOW).toContain("maximum reachable impact");
-    expect(STATIC_CYBER_WORKFLOW).toContain("Do not stop at a benign marker");
-    expect(STATIC_CYBER_WORKFLOW).toContain("UNDETERMINED → block/re-dispatch");
-    for (const removedAgent of ["report" + "er", "explo" + "it"]) {
-      expect(STATIC_CYBER_WORKFLOW).not.toContain(`agent: '${removedAgent}'`);
-    }
-    expect(STATIC_CYBER_WORKFLOW_LITE).toContain("Report style checklist");
-    expect(STATIC_CYBER_WORKFLOW_LITE).toContain("CaseContext");
-    expect(STATIC_CYBER_WORKFLOW_LITE).not.toContain("CaseReport");
-    for (const workflow of [STATIC_CYBER_WORKFLOW, STATIC_CYBER_WORKFLOW_OMP]) {
-      expect(workflow).not.toContain("| CHAIN | INVESTIGATING |");
-      expect(workflow).toContain("| MAIN REVIEW | CONFIRMED |");
-      expect(workflow).toContain("| CHAIN | CONFIRMED |");
-    }
-  });
-
-  test("/xp command defaults to swarm and /xp lite keeps single-agent mode", async () => {
-    const previous = process.env.PI_XP_MODE;
-    delete process.env.PI_XP_MODE;
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
-      const notifications: string[] = [];
-      const ctx = {
-        hasUI: false,
-        ui: {
-          notify: (message: string) => notifications.push(message),
-          setStatus: () => {},
-        },
-      };
-
-      const handler = pi.events.get("before_agent_start")?.[0];
-      expect(await handler()).toBeUndefined();
-
-      await pi.commands.get("xp").handler("", ctx);
-      expect(notifications.some((n) => n.includes("SWARM"))).toBe(true);
-      const event = { systemPrompt: "" };
-      const defaultResult = await handler(event);
-      expect(defaultResult.systemPrompt).toContain("# Cyber Workflow");
-      expect(defaultResult.systemPrompt).not.toContain("# Cyber Workflow — LITE");
-
-      await pi.commands.get("xp").handler("off", ctx);
-      expect(await handler()).toBeUndefined();
-
-      await pi.commands.get("xp").handler("on", ctx);
-      expect(notifications.some((n) => n.includes("SWARM"))).toBe(true);
-      const onResult = await handler(event);
-      expect(onResult.systemPrompt).toContain("# Cyber Workflow");
-      expect(onResult.systemPrompt).not.toContain("# Cyber Workflow — LITE");
-
-      await pi.commands.get("xp").handler("off", ctx);
-      expect(await handler()).toBeUndefined();
-
-      await pi.commands.get("xp").handler("lite", ctx);
-      expect(notifications.some((n) => n.includes("LITE"))).toBe(true);
-      const liteResult = await handler(event);
-      expect(liteResult.systemPrompt).toContain("# Cyber Workflow — LITE (Single-Agent)");
-    } finally {
-      if (previous === undefined) delete process.env.PI_XP_MODE;
-      else process.env.PI_XP_MODE = previous;
-    }
-  });
-
-  test("/xp lite sets lite mode and injects the lite workflow", async () => {
-    const previous = process.env.PI_XP_MODE;
-    delete process.env.PI_XP_MODE;
-    try {
-      const pi = createFakePi();
-      casefileExtension(pi as any);
-      const notifications: string[] = [];
-      const ctx = {
-        hasUI: false,
-        ui: {
-          notify: (message: string) => notifications.push(message),
-          setStatus: () => {},
-        },
-      };
-
-      await pi.commands.get("xp").handler("lite", ctx);
-      expect(notifications.some((n) => n.includes("LITE"))).toBe(true);
-
-      const handler = pi.events.get("before_agent_start")?.[0];
-      expect(handler).toBeFunction();
-      const result = await handler({ systemPrompt: "" });
-      expect(result.systemPrompt).toContain("# Cyber Workflow — LITE (Single-Agent)");
-      expect(result.systemPrompt).not.toContain("Evidence-First Doctrine");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;

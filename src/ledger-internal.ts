@@ -1,14 +1,14 @@
 /**
  * Internal shared plumbing for the casefile ledger modules.
  *
- * Extracted from ledger.ts so sibling modules (confirmation.ts, chains.ts)
- * can use the same DB handle, record builder, and transaction wrapper without
- * importing the whole ledger. NOT a public API — import from ledger.ts, which
- * re-exports everything callers need.
+ * The single home for the DB handle, record builder, validation, transaction
+ * wrapper, and text helpers. Both ledger.ts and its sibling modules
+ * (confirmation.ts) import these from here — one copy, no drift. NOT a public
+ * API — external callers import from ledger.ts, which re-exports what they need.
  *
  * Circular-import note: this module must stay leaf-like. It may import types
  * from ledger.ts but no runtime values, or the ledger ⇄ sibling cycle gains
- * an edge that breaks under worker threads.
+ * an edge.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -117,6 +117,7 @@ export function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): 
       input.disconfirmation !== undefined
         ? normalizeText(input.disconfirmation)
         : existing?.disconfirmation,
+    invariant: input.invariant !== undefined ? normalizeText(input.invariant) : existing?.invariant,
     disconfirmationVerified: input.disconfirmationVerified ?? existing?.disconfirmationVerified,
     controlVerified: input.controlVerified ?? existing?.controlVerified,
     pendingConfirmation: input.pendingConfirmation ?? existing?.pendingConfirmation,
@@ -225,14 +226,14 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
       references_json, blockers_json, tags_json, assumptions_json, poc_verified_json,
       disconfirmation, disconfirmation_verified_json, disprove_if_json, control_verified_json,
       pending_confirmation_json, confirmer_verdict_json,
-      reported_at, report_path, created_at, updated_at
+      reported_at, report_path, invariant, created_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?,
-      ?, ?, ?, ?
+      ?, ?, ?, ?, ?
     )
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
@@ -261,6 +262,7 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
       control_verified_json = excluded.control_verified_json,
       pending_confirmation_json = excluded.pending_confirmation_json,
       confirmer_verdict_json = excluded.confirmer_verdict_json,
+      invariant = excluded.invariant,
       reported_at = excluded.reported_at,
       report_path = excluded.report_path,
       created_at = excluded.created_at,
@@ -297,6 +299,7 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
     record.confirmerVerdict ? JSON.stringify(record.confirmerVerdict) : null,
     record.reportedAt || null,
     record.reportPath || null,
+    record.invariant || null,
     record.createdAt,
     record.updatedAt,
   );

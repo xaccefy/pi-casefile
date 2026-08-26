@@ -43,11 +43,9 @@ Peer-depends on a Pi-compatible agent host (`@earendil-works/pi-coding-agent`, `
 
 ```bash
 bun install
-bun test --isolate   # 302 tests
+bun test --isolate   # 222 tests
 bun run typecheck
 ```
-
-The JSON contracts in [`schemas/`](schemas/) are the agent-facing mirror of the `SPECS` table in `src/pipeline-submit.ts`; a drift-guard test fails if they diverge.
 
 ## License
 

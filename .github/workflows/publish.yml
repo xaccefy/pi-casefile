@@ -1,0 +1,55 @@
+name: Publish to npm
+
+# Publishes @xaccefy/pi-casefile to npm when a GitHub Release is published.
+# Requires an npm token stored as the repo secret NPM_TOKEN (use an
+# "Automation" token so it bypasses 2FA in CI).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: # manual run from the Actions tab
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test --isolate
+
+      # npm (not bun) does the publish — reliable token auth + provenance.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify the release tag matches package.json version
+        if: github.event_name == 'release'
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::package.json version ($PKG) does not match release tag ($TAG). Bump package.json or fix the tag."
+            exit 1
+          fi
+          echo "Publishing version $PKG"
+
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

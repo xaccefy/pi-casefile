@@ -504,8 +504,10 @@ export function storePendingConfirmation(id: string, bundle: PendingConfirmation
  * determinism, differential), the PoC script to be unchanged since the runs
  * (pocSha256 — otherwise the main agent reviewed different bytes), and a
  * verdict accompanied by a fresh harness-owned target-only replay, a concrete
- * review note, and a disconfirmation attempt. NOT_CONFIRMED records the
- * verdict and keeps the case investigating — no tie-breaker.
+ * review note, and a disconfirmation attempt. NOT_CONFIRMED (positively
+ * disproved) and INCONCLUSIVE (neither reproduced nor disproved) both record
+ * the verdict and keep the case investigating — INCONCLUSIVE preserves it for
+ * manual review rather than dropping it.
  */
 export function applyConfirmationResult(
   id: string,
@@ -569,8 +571,16 @@ export function applyConfirmationResult(
           : undefined,
     };
 
-    if (verdict.verdict === "NOT_CONFIRMED") {
-      const note = `main agent NOT_CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}: ${verdict.reasoning}`;
+    if (verdict.verdict !== "CONFIRMED") {
+      // NOT_CONFIRMED (positively disproved) and INCONCLUSIVE (neither reproduced
+      // nor disproved) both record the verdict, consume the attempt, and keep the
+      // case investigating — neither auto-kills. INCONCLUSIVE is the fail-safe:
+      // the finding is preserved for manual review, not dropped.
+      const model = verdict.model ? ` (${verdict.model})` : "";
+      const note =
+        verdict.verdict === "INCONCLUSIVE"
+          ? `main agent INCONCLUSIVE${model}: ${verdict.reasoning} — preserved for manual review, not disproved`
+          : `main agent NOT_CONFIRMED${model}: ${verdict.reasoning}`;
       const next = buildRecord(
         {
           confirmerVerdict: recorded,

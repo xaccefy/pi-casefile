@@ -1,12 +1,11 @@
 /**
- * Scratchpad — intermediate artifact store for pipeline runs.
+ * Scratchpad — intermediate working-notes store for a run.
  *
  * The casefile owns state transitions; the scratchpad owns artifacts.
- * Agents write their outputs here (recon maps, trace outputs, verification
- * logs) instead of stuffing everything into casefile text fields or relying
- * on each other's output streams (which creates an echo chamber).
+ * The agent writes its outputs here (recon maps, trace outputs, verification
+ * logs) instead of stuffing everything into casefile text fields.
  *
- * Directory layout per pipeline run (one subdir per phase — see PHASE_DIRS):
+ * Directory layout per run (one subdir per phase — see PHASE_DIRS):
  *   {project_root}/.scratchpad/{run_id}/
  *     recon/      — fingerprints, tech detection, surface maps
  *     hunt/       — per-class findings
@@ -74,7 +73,7 @@ export interface ScratchpadResume {
 // ── Constants ────────────────────────────────────────────────────────
 
 // All accepted artifact buckets. Some are legacy/manual-only and should not be
-// scheduled by ScratchpadResume for new swarm runs.
+// scheduled by ScratchpadResume for new runs.
 export const SCRATCHPAD_PHASES: ScratchpadPhase[] = [
   "recon",
   "hunt",

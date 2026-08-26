@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-casefile",
-  "version": "0.9.4",
+  "version": "0.10.0",
   "description": "Offensive security case tracker for Pi Agent \u2014 bug bounties, CTFs, security audits",
   "keywords": [
     "pi-package",
@@ -37,19 +37,13 @@
     "src/harness-verify.ts",
     "src/oob-oracle.ts",
     "src/confirmation.ts",
-    "src/chains.ts",
-    "src/objectives.ts",
     "src/ledger-internal.ts",
     "src/safe-state.ts",
-    "src/ledger-worker.ts",
-    "src/ledger-worker-entry.ts",
     "src/ledger.ts",
-    "src/workflow.ts",
     "src/poc-runner.ts",
-    "src/pipeline-submit.ts",
     "src/scratchpad.ts",
+    "src/workflow.ts",
     "src/sqlite-compat/index.ts",
-    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -61,9 +55,6 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "devDependencies": {

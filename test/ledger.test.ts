@@ -36,12 +36,10 @@ import {
   searchCases,
   setCasefilePath,
   storePendingConfirmation,
-  suggestChains,
   unlinkCasesResult,
   updateCaseResult,
   writeCaseContext,
 } from "../src/ledger.ts";
-import { suggestChainsAsync, writeCaseContextAsync } from "../src/ledger-worker.ts";
 import {
   scratchpad_checkpoint,
   scratchpad_init,
@@ -322,6 +320,16 @@ afterEach(async () => {
 });
 
 describe("casefile sqlite ledger", () => {
+  it("persists and updates the security invariant field", () => {
+    const rec = addCase({
+      title: "IDOR on orders",
+      invariant: "a user cannot read another user's orders",
+    });
+    assert.strictEqual(getCaseById(rec.id)?.invariant, "a user cannot read another user's orders");
+    updateCaseResult(rec.id, { invariant: "a user cannot modify another user's cart" });
+    assert.strictEqual(getCaseById(rec.id)?.invariant, "a user cannot modify another user's cart");
+  });
+
   it("garbage-collects only old, unreferenced harness evidence", () => {
     const record = addCase({ title: "Evidence GC fixture" });
     const evidenceDir = join(tempDir, ".pi", "poc-evidence");
@@ -926,6 +934,23 @@ describe("casefile sqlite ledger", () => {
       }),
     );
     assert.strictEqual(refused.record.status, "investigating");
+
+    // INCONCLUSIVE also needs no CONFIRMED-only fields; it preserves the case
+    // (stays investigating) and records a manual-review note rather than dropping it.
+    storePendingConfirmation(rec.id, pendingBundle(rec.id));
+    const inconclusive = applyConfirmationResult(
+      rec.id,
+      makeVerdict({
+        verdict: "INCONCLUSIVE",
+        differential: "unclear",
+        disconfirmation_attempt: undefined,
+      }),
+    );
+    assert.strictEqual(inconclusive.record.status, "investigating");
+    assert.ok(
+      inconclusive.record.assumptions?.some((a) => a.includes("INCONCLUSIVE")),
+      "INCONCLUSIVE verdict recorded as a preserved-for-review note",
+    );
 
     // CONFIRMED requires a disconfirmation attempt, a target-only differential,
     // a concrete review note, and a fresh harness replay. A verdict missing
@@ -1746,177 +1771,6 @@ describe("casefile sqlite ledger", () => {
     assert.match(viaSingle.evidenceItems[0].sha256 ?? "", /^[0-9a-f]{64}$/);
   });
 
-  it("suggests exploit chains from cases", () => {
-    const cred = addCase({
-      title: "Leaked API key in repo",
-      status: "investigating",
-      evidence: "Key in public repo",
-      confidence: "high",
-      impact: "credential exposure",
-      severity: "high",
-      target: "example-app",
-    });
-    const endpoint = addCase({
-      title: "Admin login endpoint",
-      status: "investigating",
-      evidence: "Login accepts credentials",
-      confidence: "high",
-      impact: "auth",
-      severity: "medium",
-      target: "example-app",
-    });
-
-    const suggestions = suggestChains();
-    const ato = suggestions.find((s) => s.pattern === "credential_endpoint");
-    assert.ok(ato, "credential_endpoint chain suggested");
-    assert.strictEqual(ato!.sourceId, cred.id);
-    assert.strictEqual(ato!.targetId, endpoint.id);
-    assert.strictEqual(ato!.confidence, 60); // investigating pair (neither confirmed)
-
-    // Only pairs on the same asset chain.
-    const other = addCase({
-      title: "XSS in unrelated-app",
-      evidence: "reflected",
-      target: "other-app",
-    });
-    const xssSuggestions = suggestChains(other.id).filter((s) => s.pattern === "xss_csrf");
-    assert.strictEqual(xssSuggestions.length, 0);
-  });
-
-  it("does not suggest chains from ruled-out evidence sentences", () => {
-    const cred = addCase({
-      title: "Leaked API key in repo",
-      status: "investigating",
-      evidence: "Key in public repo",
-      confidence: "high",
-      impact: "credential exposure",
-      severity: "high",
-      target: "negation-app",
-    });
-    // The credential keyword appears only in a ruled-out sentence.
-    const endpoint = addCase({
-      title: "Admin login endpoint",
-      status: "investigating",
-      evidence: "Login accepts credentials. SSRF ruled out on all hosts.",
-      confidence: "high",
-      impact: "auth",
-      severity: "medium",
-      target: "negation-app",
-    });
-    const suggestions = suggestChains();
-    assert.ok(
-      suggestions.some((s) => s.pattern === "credential_endpoint"),
-      "the positive credential sentence still chains",
-    );
-    assert.ok(
-      !suggestions.some((s) => s.pattern === "info_disclosure_ssrf" && s.sourceId === endpoint.id),
-      "the ruled-out SSRF sentence must not produce an SSRF chain",
-    );
-    void cred;
-  });
-
-  it("does not re-suggest pairs that are already linked", () => {
-    const cred = addCase({
-      title: "Leaked API key in repo",
-      status: "investigating",
-      evidence: "Key in public repo",
-      confidence: "high",
-      impact: "credential exposure",
-      severity: "high",
-      target: "linked-app",
-    });
-    const endpoint = addCase({
-      title: "Admin login endpoint",
-      status: "investigating",
-      evidence: "Login accepts credentials",
-      confidence: "high",
-      impact: "auth",
-      severity: "medium",
-      target: "linked-app",
-    });
-    linkCasesResult(cred.id, endpoint.id, "depends-on");
-    const suggestions = suggestChains();
-    assert.ok(
-      !suggestions.some((s) => s.pattern === "credential_endpoint" && s.sourceId === cred.id),
-      "an already-linked pair is existing knowledge, not a suggestion",
-    );
-  });
-
-  it("async offload (worker thread) matches the inline implementation", async () => {
-    addCase({
-      title: "Leaked API key in repo",
-      status: "investigating",
-      evidence: "Key in public repo",
-      confidence: "high",
-      impact: "credential exposure",
-      severity: "high",
-      target: "worker-app",
-    });
-    addCase({
-      title: "Admin login endpoint",
-      status: "investigating",
-      evidence: "Login accepts credentials",
-      confidence: "high",
-      impact: "auth",
-      severity: "medium",
-      target: "worker-app",
-    });
-    const inline = suggestChains();
-    const offloaded = await suggestChainsAsync();
-    assert.deepStrictEqual(offloaded, inline);
-    assert.ok(offloaded.length > 0);
-  });
-
-  it("does not pair unrelated targets whose names overlap as substrings", () => {
-    // Regression: sameAssetOrRelated used a bare substring check, so
-    // "myshop.io".includes("shop.io") paired two unrelated targets as one
-    // asset and suggested a credential+endpoint chain between them.
-    const cred = addCase({
-      title: "Leaked API key in repo",
-      status: "investigating",
-      evidence: "Key in public repo",
-      confidence: "high",
-      impact: "credential exposure",
-      severity: "high",
-      target: "shop.io",
-    });
-    const endpoint = addCase({
-      title: "Admin login endpoint",
-      status: "investigating",
-      evidence: "Login accepts credentials",
-      confidence: "high",
-      impact: "auth",
-      severity: "medium",
-      target: "myshop.io",
-    });
-    assert.strictEqual(suggestChains().length, 0, "no chain across unrelated targets");
-
-    // Subdomain relation still pairs (label-boundary aware).
-    const subCred = addCase({
-      title: "Leaked token",
-      status: "investigating",
-      evidence: "Token in docs",
-      confidence: "high",
-      target: "api.example-app.com",
-    });
-    const subEndpoint = addCase({
-      title: "Admin panel",
-      status: "investigating",
-      evidence: "Login accepts credentials",
-      confidence: "high",
-      target: "example-app.com",
-    });
-    const pair = suggestChains().filter((s) => s.sourceId === subCred.id);
-    assert.ok(
-      pair.some((s) => s.targetId === subEndpoint.id),
-      "subdomain targets still pair",
-    );
-    assert.strictEqual(
-      pair.some((s) => s.targetId === cred.id || s.targetId === endpoint.id),
-      false,
-    );
-  });
-
   it("rejects field mutations on killed and reported cases", () => {
     const killed = addCase({
       title: "Dead lead",
@@ -2185,7 +2039,7 @@ describe("casefile sqlite ledger", () => {
     );
   });
 
-  it("worker-thread CaseContext reads artifacts from the configured scratchpad root", async () => {
+  it("CaseContext reads artifacts from the configured scratchpad root", async () => {
     const record = addCase({
       title: "Worker context artifact",
       status: "investigating",
@@ -2214,7 +2068,7 @@ describe("casefile sqlite ledger", () => {
       tempDir,
     );
 
-    const { contextPath } = await writeCaseContextAsync(record.id);
+    const { contextPath } = writeCaseContext(record.id);
     const context = readFileSync(contextPath, "utf8");
     assert.ok(context.includes("run-worker-context"));
     assert.ok(context.includes("worker-thread-visible-artifact"));
