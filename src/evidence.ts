@@ -385,6 +385,48 @@ export function normalizeEvidence(e: PoCEvidence): string {
   return JSON.stringify({ claim: e.claim, verify: e.verify, baseline: e.baseline });
 }
 
+// ── Artifact secret scanning (defense in depth) ──────────────────────
+//
+// Evidence artifacts are raw target responses and logs — they routinely
+// contain live credentials. The gate never blocks storage (an engaged
+// finding must keep its proof), it FLAGS the item so every later view can
+// redact or warn. Best-effort pattern matching only: labels are recorded,
+// matched VALUES are never persisted by the scanner itself.
+
+/** Label → pattern. Linear regexes only (artifacts reach 10 MiB). */
+const SECRET_PATTERNS: ReadonlyArray<{ label: string; pattern: RegExp }> = [
+  { label: "aws-access-key", pattern: /\bAKIA[0-9A-Z]{16}\b/g },
+  { label: "google-api-key", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g },
+  { label: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,255}\b/g },
+  { label: "slack-token", pattern: /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/g },
+  {
+    label: "private-key-block",
+    pattern: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g,
+  },
+  { label: "bearer-token", pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/gi },
+  { label: "jwt", pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g },
+  {
+    label: "credential-assignment",
+    pattern:
+      /\b(?:api[_-]?key|apikey|secret|token|passwd|password)\b["']?\s*[:=]\s*["'][^"'\s]{12,}["']/gi,
+  },
+];
+
+/**
+ * Scan artifact bytes for embedded secret material. Returns the LABELS of the
+ * patterns that matched (deduplicated, order of first match) — never the
+ * matched values themselves.
+ */
+export function scanArtifactForSecrets(bytes: Buffer): string[] {
+  const text = bytes.toString("utf8");
+  const labels: string[] = [];
+  for (const { label, pattern } of SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) labels.push(label);
+  }
+  return labels;
+}
+
 // ── Main-agent confirmation verdict ─────────────────────────────────
 
 // INCONCLUSIVE is the fail-safe verdict: the reviewer could neither reproduce
@@ -404,6 +446,82 @@ export type ConfirmDifferential = (typeof CONFIRM_DIFFERENTIAL_VALUES)[number];
 export const SEVERITY_MATCH_VALUES = ["under", "over", "ok"] as const;
 export const CANARY_ASSESSMENT_VALUES = ["verified", "not_applicable"] as const;
 
+// ── Quorum panel votes (advisory, CONFIRMED-blocking) ───────────────
+
+export const PANEL_VERDICT_VALUES = ["exploit", "not_exploit", "inconclusive"] as const;
+export type PanelVote = {
+  verdict: (typeof PANEL_VERDICT_VALUES)[number];
+  rationale: string;
+  model: string;
+  at?: string;
+};
+
+/** Bounded panel: enough voices for 2/3 quorum, small enough to stay cheap. */
+const MAX_PANEL_VOTES = 5;
+
+/**
+ * Validate panel votes recorded on a promotion bundle. Votes are advisory —
+ * they gate only the CONFIRMED commit (quorum or explicit override note) —
+ * but their SHAPE is machine-checked so a malformed panel cannot silently
+ * count as a quorum.
+ */
+export function validatePanelVotes(
+  raw: unknown,
+): { ok: true; votes: PanelVote[] } | { ok: false; error: string } {
+  if (!Array.isArray(raw)) return { ok: false, error: "panel_votes must be an array" };
+  if (raw.length === 0) return { ok: false, error: "panel_votes must not be empty when provided" };
+  if (raw.length > MAX_PANEL_VOTES) {
+    return { ok: false, error: `panel_votes exceeds ${MAX_PANEL_VOTES} entries` };
+  }
+  for (const [index, v] of raw.entries()) {
+    if (!isRecord(v)) return { ok: false, error: `panel_votes[${index}] must be an object` };
+    if (
+      !nonEmptyString(v.verdict) ||
+      !(PANEL_VERDICT_VALUES as readonly string[]).includes(v.verdict)
+    ) {
+      return {
+        ok: false,
+        error: `panel_votes[${index}].verdict must be one of ${PANEL_VERDICT_VALUES.join(" | ")}`,
+      };
+    }
+    if (!nonEmptyString(v.rationale)) {
+      return { ok: false, error: `panel_votes[${index}].rationale must be a non-empty string` };
+    }
+    if (!nonEmptyString(v.model)) {
+      return { ok: false, error: `panel_votes[${index}].model must be a non-empty string` };
+    }
+    if (v.at !== undefined) {
+      if (!nonEmptyString(v.at) || !Number.isFinite(Date.parse(v.at))) {
+        return { ok: false, error: `panel_votes[${index}].at must be a parseable timestamp` };
+      }
+    }
+  }
+  return { ok: true, votes: raw as unknown as PanelVote[] };
+}
+
+/**
+ * Quorum rule: a panel of at least 3 votes with at least 2 exploit verdicts
+ * and exploit strictly ahead of not_exploit. Anything else — no panel, a tied
+ * panel, or a dissenting majority — requires the main agent's explicit
+ * override note to CONFIRM.
+ */
+export function panelQuorumReached(votes: PanelVote[] | undefined): {
+  quorum: boolean;
+  exploit: number;
+  notExploit: number;
+  total: number;
+} {
+  const list = votes ?? [];
+  const exploit = list.filter((v) => v.verdict === "exploit").length;
+  const notExploit = list.filter((v) => v.verdict === "not_exploit").length;
+  return {
+    quorum: list.length >= 3 && exploit >= 2 && exploit > notExploit,
+    exploit,
+    notExploit,
+    total: list.length,
+  };
+}
+
 export type MainAgentVerdict = {
   verdict: ConfirmVerdict;
   reasoning: string;
@@ -421,6 +539,12 @@ export type MainAgentVerdict = {
   canary_assessment?: (typeof CANARY_ASSESSMENT_VALUES)[number];
   /** Why no meaningful canary oracle exists for this exploit class. */
   canary_reason?: string;
+  /**
+   * Why CONFIRMED proceeds without a 2/3 exploit panel quorum (no panel
+   * provisioned, panel unavailable, or documented disagreement). Required for
+   * CONFIRMED whenever quorum was not reached.
+   */
+  panel_override_note?: string;
   /** Which model judged (recorded for the accuracy ledger). */
   model?: string;
 };
@@ -471,6 +595,9 @@ export function validateMainAgentVerdict(
   }
   if (raw.canary_reason !== undefined && !nonEmptyString(raw.canary_reason)) {
     return { ok: false, error: "verdict canary_reason must be a non-empty string" };
+  }
+  if (raw.panel_override_note !== undefined && !nonEmptyString(raw.panel_override_note)) {
+    return { ok: false, error: "verdict panel_override_note must be a non-empty string" };
   }
   if (
     raw.severity_match !== undefined &&

@@ -21,18 +21,23 @@ import {
   addEvidenceItemResult,
   applyConfirmationResult,
   assertPromotable,
+  type CaseUpdate,
   coverageSummary,
+  formatCaseDetail,
   getCaseById,
   getCasefilePath,
   addCaseResult as ledgerAddCaseResult,
   linkCasesResult,
+  listCaseEvents,
   listEvidenceItems,
   type MainAgentVerification,
   type PendingConfirmation,
   POC_EVIDENCE_GC_GRACE_MS,
   type PocEvidenceRun,
+  ReportContractError,
   readCasefile,
   recordCoverageResult,
+  reportContractPathFor,
   searchCases,
   setCasefilePath,
   storePendingConfirmation,
@@ -40,12 +45,7 @@ import {
   updateCaseResult,
   writeCaseContext,
 } from "../src/ledger.ts";
-import {
-  scratchpad_checkpoint,
-  scratchpad_init,
-  scratchpad_write,
-  setScratchpadRoot,
-} from "../src/scratchpad.ts";
+import { scratchpad_write, setScratchpadRoot } from "../src/scratchpad.ts";
 import { DatabaseSync } from "../src/sqlite-compat/index.ts";
 
 /** Writes the artifact file backing the helper observation evidence item. */
@@ -135,6 +135,53 @@ function writeGoodReport(reportPath: string): void {
   writeFileSync(
     reportPath,
     `# Stored XSS in chat\n\n## Summary\nReflected input is rendered without encoding, allowing script execution.\n\n## Vulnerability Details\nThe search endpoint reflects the query parameter into the page.\n\n## Steps to Reproduce\n1. Submit a payload.\n2. Observe execution.\n\n## Impact\nAn attacker can execute script in a victim's session and steal tokens.\n\n## Remediation\nEncode output at the sink; add a CSP.\n`,
+    "utf8",
+  );
+}
+
+/** Writes the closed-schema report contract that passes the contract gate. */
+function writeGoodContract(caseId: string, reportPath: string): void {
+  const record = getCaseById(caseId);
+  assert.ok(record, "contract fixture: case exists");
+  writeFileSync(
+    reportContractPathFor(reportPath),
+    JSON.stringify(
+      {
+        case_id: caseId,
+        title: record.title,
+        severity: record.severity ?? "medium",
+        summary: "fixture summary of the finding",
+        impact: "fixture impact statement",
+        remediation: "fixture remediation",
+        steps: ["submit the payload", "observe execution"],
+        evidence_ids: record.evidenceItems.map((e) => e.id),
+        coverage_refs: [],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+}
+
+/**
+ * Seed a legacy scratchpad checkpoint (state.json) the way pre-slim runs
+ * wrote them — the write-side checkpoint API is gone, but CaseContext still
+ * gates on phase_ids when a checkpoint is present.
+ */
+function seedRunCheckpoint(runId: string, phaseIds: Record<string, string[]>): void {
+  writeFileSync(
+    join(tempDir, ".scratchpad", runId, "state.json"),
+    JSON.stringify({
+      run_id: runId,
+      project_root: tempDir,
+      created_at: new Date().toISOString(),
+      last_updated: new Date().toISOString(),
+      last_phase_at: null,
+      completed_phases: Object.keys(phaseIds),
+      phase_ids: phaseIds,
+      phase_summaries: {},
+    }),
     "utf8",
   );
 }
@@ -278,6 +325,7 @@ function makeVerdict(overrides: Partial<ConfirmerVerdict> = {}): ConfirmerVerdic
       "tried /read?file=/etc/shadow and a patched replica → no entry; the effect is target-dependent",
     canary_assessment: "not_applicable",
     canary_reason: "file-read output is fixed target state and has no attacker-reflected field",
+    panel_override_note: "test fixture: panel not provisioned",
     model: "test-model",
     ...overrides,
   };
@@ -576,6 +624,78 @@ describe("casefile sqlite ledger", () => {
     assert.match(res.reason ?? "", /near-duplicate/i);
   });
 
+  it("material non-scope updates apply even when a live near-duplicate exists (legacy pair)", () => {
+    seedCommonVocabulary();
+    const first = addCaseResult({
+      title: "OAuth dev callback CSRF: no state param, no origin check",
+      target: "api.example.test",
+    });
+    // Seed a live near-dup row the way pre-gate 0.9.4 ledgers contain them:
+    // direct SQL (the add/update gates now refuse this shape on fresh data).
+    const raw = new DatabaseSync(ledgerPath);
+    const now = new Date().toISOString();
+    raw
+      .prepare(
+        `INSERT INTO cases (id, title, status, ever_advanced, confidence, evidence, target, disprove_if_json, created_at, updated_at)
+       VALUES (?, ?, 'investigating', 0, 'medium', 'probe', ?, ?, ?, ?)`,
+      )
+      .run(
+        "case_legacy_dup",
+        "OAuth dev callback CSRF no state param missing origin check",
+        "api.example.test",
+        JSON.stringify(["legacy: intended behavior"]),
+        now,
+        now,
+      );
+    raw.close();
+
+    // A scope-field change toward the near-dup is still refused…
+    const blocked = updateCaseResult("case_legacy_dup", {
+      title: "OAuth callback CSRF/race in generate-iap-token: missing state + first-callback-wins",
+    });
+    assert.strictEqual(blocked.changed, false);
+    assert.match(blocked.reason ?? "", /near-duplicate|duplicate/i);
+
+    // …but a material update that does not touch identity fields applies —
+    // the duplicate gate must not freeze legacy pairs (killing/retiring a
+    // known duplicate is the documented recovery).
+    const res = updateCaseResult("case_legacy_dup", {
+      nextStep: "Duplicate of the OAuth CSRF case — retire it",
+    });
+    assert.strictEqual(res.changed, true);
+    assert.strictEqual(res.record.nextStep, "Duplicate of the OAuth CSRF case — retire it");
+    // The other side of the pair is equally unfrozen.
+    const other = updateCaseResult(first.record.id, { evidence: "probe v2" });
+    assert.strictEqual(other.changed, true);
+  });
+
+  it("near-dup gate does not merge distinct bug classes on the same target", () => {
+    seedCommonVocabulary();
+    const rce = addCaseResult({
+      title: "ImageTragick RCE via avatar upload handler",
+      target: "cdn.example.test",
+      bugClass: "rce",
+    });
+    assert.strictEqual(rce.created, true);
+
+    // Same distinctive title words, different bug class → distinct finding,
+    // not a near-duplicate redirect.
+    const ssrf = addCaseResult({
+      title: "ImageTragick SSRF via avatar upload handler",
+      target: "cdn.example.test",
+      bugClass: "ssrf",
+    });
+    assert.strictEqual(ssrf.created, true);
+
+    // Same bug class + overlapping title → still redirected to the existing case.
+    const dup = addCaseResult({
+      title: "ImageTragick command injection via avatar upload handler",
+      target: "cdn.example.test",
+      bugClass: "rce",
+    });
+    assert.strictEqual(dup.created, false);
+  });
+
   it("near-dup boundary: 2 shared tokens or common-vocabulary overlap does NOT fire; 3 distinctive fires", () => {
     // Distinctive tokens only (stopwords are suppressed): alpha/bravo/… are
     // made-up 5+ char words so the counts are exact. Seed the corpus so the
@@ -663,6 +783,7 @@ describe("casefile sqlite ledger", () => {
     promote(original.id);
     const { path } = writeCaseContext(original.id);
     writeGoodReport(path);
+    writeGoodContract(original.id, path);
     updateCaseResult(original.id, { status: "reported" });
 
     // An exact duplicate of a REPORTED case is a new follow-up case, not a merge.
@@ -794,10 +915,12 @@ describe("casefile sqlite ledger", () => {
     assert.ok(dupA.linkedCases.some((l) => l.id === b.id && l.kind === "duplicate"));
     assert.ok(dupB.linkedCases.some((l) => l.id === a.id && l.kind === "duplicate"));
 
-    // Unknown kind falls back to the default rather than throwing.
+    // Unknown kind throws rather than silently degrading to "related".
     unlinkCasesResult(a.id, b.id);
-    const fallback = linkCasesResult(a.id, b.id, "nonsense" as unknown as string);
-    assert.strictEqual(fallback.kind, "related");
+    assert.throws(
+      () => linkCasesResult(a.id, b.id, "nonsense" as unknown as string),
+      /Invalid link kind: nonsense/,
+    );
   });
 
   it("promotes hypothesis → investigating using evidence already on the case", () => {
@@ -1433,8 +1556,9 @@ describe("casefile sqlite ledger", () => {
         }),
       /not found on this case/,
     );
-    // Unbacked cells are allowed but flagged (no evidenceItemId) — CoverageReport
-    // renders them distinctly as unbacked.
+    // Unbacked cells are allowed but flagged (no evidenceItemId) — the
+    // CoverageAdd response and coverage reads render them distinctly as
+    // unbacked.
     const unbacked = recordCoverageResult(c.id, {
       asset: "a",
       class: "ssti",
@@ -1442,6 +1566,29 @@ describe("casefile sqlite ledger", () => {
       note: "no reflection",
     });
     assert.strictEqual(unbacked.evidenceItemId, undefined);
+  });
+
+  it("coverage cells fold asset/class case differences into one cell", () => {
+    const c = addCase({ title: "Coverage case folding", target: "shop.test" });
+    recordCoverageResult(c.id, {
+      asset: "Api.shop.test",
+      class: "SQL-Injection",
+      scope: "local",
+      note: "no sqli",
+    });
+    recordCoverageResult(c.id, {
+      asset: "api.shop.test",
+      class: "sql-injection",
+      scope: "local",
+      note: "retest of the same cell",
+    });
+    const sum = coverageSummary(c.id);
+    // Both records are kept (audit trail) but they land on ONE cell identity.
+    assert.strictEqual(sum.items.length, 2);
+    assert.strictEqual(sum.assets.length, 1);
+    assert.strictEqual(sum.classes.length, 1);
+    assert.strictEqual(sum.assets[0], "api.shop.test");
+    assert.strictEqual(sum.classes[0], "sql-injection");
   });
 
   it("near-dup redirect surfaces the existing case title (no silent drop)", () => {
@@ -1551,7 +1698,7 @@ describe("casefile sqlite ledger", () => {
             summary: "symlink file",
             artifactPath: linked,
           }),
-        /must not be a symbolic link/,
+        /non-symlink/,
       );
       assert.strictEqual(listEvidenceItems(c.id).length, 0);
     } finally {
@@ -1802,6 +1949,7 @@ describe("casefile sqlite ledger", () => {
     // gate: non-trivial size, required sections, no internal identifiers).
     const { path } = writeCaseContext(live.id);
     writeGoodReport(path);
+    writeGoodContract(live.id, path);
     updateCaseResult(live.id, { status: "reported" });
     assert.throws(
       () => updateCaseResult(live.id, { summary: "should not stick" }),
@@ -1815,6 +1963,7 @@ describe("casefile sqlite ledger", () => {
       target: "app.test",
       bugClass: "sqli",
       severity: "high",
+      confidence: "high",
       tags: ["inj", "auth"],
       summary: "UNION-based extraction",
     });
@@ -1823,6 +1972,7 @@ describe("casefile sqlite ledger", () => {
       target: "app.test",
       bugClass: "xss",
       severity: "low",
+      confidence: "medium",
       tags: ["inj"],
       summary: "reflects query in HTML",
     });
@@ -1831,6 +1981,7 @@ describe("casefile sqlite ledger", () => {
       target: "other.test",
       bugClass: "redirect",
       severity: "info",
+      confidence: "low",
       tags: ["web"],
     });
 
@@ -1862,6 +2013,23 @@ describe("casefile sqlite ledger", () => {
     const page = searchCases({ limit: 1, offset: 0 });
     assert.strictEqual(page.total, 3);
     assert.strictEqual(page.cases.length, 1);
+
+    // confidence filter
+    const byConf = searchCases({ confidence: "medium" });
+    assert.strictEqual(byConf.total, 1);
+    assert.strictEqual(byConf.cases[0].bugClass, "xss");
+
+    // offset pages past the first page
+    const page2 = searchCases({ limit: 1, offset: 1 });
+    assert.strictEqual(page2.total, 3);
+    assert.strictEqual(page2.cases.length, 1);
+    assert.notStrictEqual(page2.cases[0].id, page.cases[0].id);
+
+    // unknown field names are rejected before SQL is built
+    assert.throws(
+      () => searchCases({ field: "title; DROP TABLE cases" as never }),
+      /Invalid search field/,
+    );
   });
 
   it("searchCases treats LIKE wildcards in the query literally", () => {
@@ -1917,13 +2085,6 @@ describe("casefile sqlite ledger", () => {
 
     // A scratchpad run that produced this case: recon map + trace output.
     setScratchpadRoot(tempDir);
-    scratchpad_init("run-idor-2026", tempDir);
-    scratchpad_checkpoint(
-      "run-idor-2026",
-      "recon",
-      { ids: [record.id], summary: "surface mapped" },
-      tempDir,
-    );
     scratchpad_write(
       "run-idor-2026",
       "recon",
@@ -1931,15 +2092,9 @@ describe("casefile sqlite ledger", () => {
       "# Entry points\n- GET /exports/{id} (unauth probe observed)",
       tempDir,
     );
+    seedRunCheckpoint("run-idor-2026", { recon: [record.id] });
     // A SECOND run belonging to a different case must be excluded from the
     // bundle, plus a corrupt-state run dir that must be skipped, not crash.
-    scratchpad_init("run-other-2026", tempDir);
-    scratchpad_checkpoint(
-      "run-other-2026",
-      "recon",
-      { ids: [chainStep.record.id], summary: "other surface" },
-      tempDir,
-    );
     scratchpad_write(
       "run-other-2026",
       "recon",
@@ -1947,6 +2102,7 @@ describe("casefile sqlite ledger", () => {
       "# OTHER run — must NOT appear in this context",
       tempDir,
     );
+    seedRunCheckpoint("run-other-2026", { recon: [chainStep.record.id] });
     const runDir = join(tempDir, ".scratchpad", "run-corrupt-2026");
     mkdirSync(runDir, { recursive: true });
     writeFileSync(join(runDir, "state.json"), "{ not json", "utf8");
@@ -2014,13 +2170,6 @@ describe("casefile sqlite ledger", () => {
     // Run checkpointed with NO ids (recon/hunt often record none), but the
     // artifact filename itself carries the case id — must still surface.
     setScratchpadRoot(tempDir);
-    scratchpad_init("run-gate-2026", tempDir);
-    scratchpad_checkpoint(
-      "run-gate-2026",
-      "skeptic",
-      { ids: [], summary: "no ids recorded" },
-      tempDir,
-    );
     scratchpad_write(
       "run-gate-2026",
       "skeptic",
@@ -2028,6 +2177,7 @@ describe("casefile sqlite ledger", () => {
       JSON.stringify({ finding_id: record.id, verdict: "CONFIRMED" }),
       tempDir,
     );
+    seedRunCheckpoint("run-gate-2026", { skeptic: [] });
 
     const { contextPath } = writeCaseContext(record.id);
     const context = readFileSync(contextPath, "utf8");
@@ -2053,13 +2203,6 @@ describe("casefile sqlite ledger", () => {
     promote(record.id);
 
     setScratchpadRoot(tempDir);
-    scratchpad_init("run-worker-context", tempDir);
-    scratchpad_checkpoint(
-      "run-worker-context",
-      "recon",
-      { ids: [record.id], summary: "worker context fixture" },
-      tempDir,
-    );
     scratchpad_write(
       "run-worker-context",
       "recon",
@@ -2067,6 +2210,7 @@ describe("casefile sqlite ledger", () => {
       "worker-thread-visible-artifact",
       tempDir,
     );
+    seedRunCheckpoint("run-worker-context", { recon: [record.id] });
 
     const { contextPath } = writeCaseContext(record.id);
     const context = readFileSync(contextPath, "utf8");
@@ -2270,6 +2414,7 @@ describe("casefile sqlite ledger", () => {
     );
     // A clean report → transition commits AND reportedAt is stamped at commit time.
     writeGoodReport(path);
+    writeGoodContract(rec.id, path);
     const done = updateCaseResult(rec.id, { status: "reported" });
     assert.strictEqual(done.record.status, "reported");
     assert.ok(done.record.reportedAt, "reportedAt stamped on the transition");
@@ -2289,6 +2434,351 @@ describe("casefile sqlite ledger", () => {
     writeCaseContext(fresh.id);
     const afterCtx = readCasefile().find((c) => c.id === fresh.id)!;
     assert.strictEqual(afterCtx.reportedAt, undefined, "reportedAt NOT stamped by CaseContext");
+  });
+});
+
+describe("event journal (append-only case_events)", () => {
+  it("appends on create, update, status change, evidence, coverage, and links — seq monotonic", () => {
+    const a = addCase({ title: "Journal case A", target: "journal-a.test" });
+    const b = addCase({ title: "Journal case B", target: "journal-b.test" });
+
+    updateCaseResult(a.id, { confidence: "high" });
+    updateCaseResult(a.id, { status: "investigating", evidence: "probe trace" });
+    addEvidenceItemResult(a.id, { role: "impact", summary: "impact note" });
+    recordCoverageResult(a.id, {
+      asset: "journal-a.test",
+      class: "xss",
+      scope: "local",
+      note: "tested",
+    });
+    linkCasesResult(a.id, b.id, "blocks");
+    unlinkCasesResult(a.id, b.id);
+
+    const events = listCaseEvents(a.id);
+    const types = events.map((e) => e.eventType);
+    // (the second evidence_added is the addCase helper's observation fixture)
+    assert.deepStrictEqual(types, [
+      "case_created",
+      "evidence_added",
+      "case_updated",
+      "status_changed",
+      "evidence_added",
+      "coverage_added",
+      "case_linked",
+      "case_unlinked",
+    ]);
+    // Seq is 1-based and strictly monotonic.
+    assert.deepStrictEqual(
+      events.map((e) => e.seq),
+      [1, 2, 3, 4, 5, 6, 7, 8],
+    );
+    // Every event carries a timestamp and an actor; payloads stay small.
+    for (const e of events) {
+      assert.ok(Number.isFinite(Date.parse(e.timestamp)));
+      assert.strictEqual(e.actor, "agent");
+    }
+    const statusChange = events[3];
+    assert.strictEqual(statusChange.payload?.from, "hypothesis");
+    assert.strictEqual(statusChange.payload?.to, "investigating");
+    // The link was journaled on BOTH cases.
+    assert.ok(listCaseEvents(b.id).some((e) => e.eventType === "case_linked"));
+  });
+
+  it("journals gate transitions (promotion_pending, case_confirmed) and surfaces the timeline in CaseContext", () => {
+    const rec = addCase({
+      title: "Journal gate case",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: pocScriptPath("journal-poc.sh"),
+      target: "journal-gate.test",
+      disconfirmation: "Tried; held.",
+    });
+    promote(rec.id);
+    const types = listCaseEvents(rec.id).map((e) => e.eventType);
+    assert.ok(types.includes("promotion_pending"));
+    assert.ok(types.includes("case_confirmed"));
+    const confirmed = types.indexOf("case_confirmed");
+    const pending = types.indexOf("promotion_pending");
+    assert.ok(confirmed > pending, "confirmation event follows the pending event");
+    // Gate events are attributed to the harness / main agent, not "agent".
+    const actors = new Set(
+      listCaseEvents(rec.id)
+        .filter((e) => e.eventType === "promotion_pending" || e.eventType === "case_confirmed")
+        .map((e) => e.actor),
+    );
+    assert.ok([...actors].every((a) => a === "harness" || a === "main_agent"));
+
+    const ctx = writeCaseContext(rec.id);
+    const body = readFileSync(ctx.contextPath, "utf8");
+    assert.ok(body.includes("Event Timeline (append-only journal)"));
+    assert.ok(body.includes("[promotion_pending]"));
+    assert.ok(body.includes("[case_confirmed]"));
+  });
+});
+
+describe("artifact secret gate (defense in depth)", () => {
+  it("flags an artifact containing an AWS-style key without blocking storage", () => {
+    const rec = addCase({ title: "Secret artifact case", target: "leaky.test" });
+    const p = join(tempDir, "leaky.txt");
+    writeFileSync(
+      p,
+      "config dump:\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\nregion us-east-1\n",
+      "utf8",
+    );
+    const item = addEvidenceItemResult(rec.id, {
+      role: "observation",
+      summary: "leaked config",
+      artifactPath: p,
+    });
+    assert.strictEqual(item.containsSecret, true);
+    assert.ok(item.secretFindings?.includes("aws-access-key"));
+    // Stored, not blocked: the item is persisted and re-readable with the flag.
+    const stored = listEvidenceItems(rec.id).find((e) => e.id === item.id);
+    assert.ok(stored);
+    assert.strictEqual(stored.containsSecret, true);
+    assert.ok(stored.secretFindings?.includes("aws-access-key"));
+    // CaseGet/CaseDetail render the warning.
+    assert.ok(formatCaseDetail(getCaseById(rec.id)!).includes("CONTAINS SUSPECTED SECRETS"));
+  });
+
+  it("leaves clean artifacts unflagged", () => {
+    const rec = addCase({ title: "Clean artifact case", target: "clean.test" });
+    const p = join(tempDir, "clean.txt");
+    writeFileSync(p, "just a normal response body with no credentials\n", "utf8");
+    const item = addEvidenceItemResult(rec.id, {
+      role: "observation",
+      summary: "clean capture",
+      artifactPath: p,
+    });
+    assert.notStrictEqual(item.containsSecret, true);
+    assert.strictEqual(item.secretFindings, undefined);
+  });
+
+  it("flags a private key block and a bearer token, and redacts OOB tokens in rendered output", () => {
+    const rec = addCase({
+      title: "Key material case",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "high",
+      poc: pocScriptPath("keys-poc.sh"),
+      target: "keys.test",
+      disconfirmation: "Tried; held.",
+    });
+    const p = join(tempDir, "keys.txt");
+    writeFileSync(
+      p,
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz123456\n",
+      "utf8",
+    );
+    const item = addEvidenceItemResult(rec.id, {
+      role: "impact",
+      summary: "key material",
+      artifactPath: p,
+    });
+    assert.ok(item.secretFindings?.includes("private-key-block"));
+    assert.ok(item.secretFindings?.includes("bearer-token"));
+
+    // OOB tokens in a pending bundle render as sha256 fingerprints, never raw.
+    const bundle = pendingBundle(rec.id);
+    bundle.oobTokens = {
+      targetToken: "raw-target-token-secret",
+      controlToken: "raw-control-token-secret",
+    };
+    bundle.callbackVerified = {
+      attempted: true,
+      targetHits: 1,
+      controlHits: 0,
+      sourceSeparated: true,
+      note: "fixture",
+    };
+    // The OOB-only shape must survive the store gate: drop the control run.
+    const oobBundle = { ...bundle } as PendingConfirmation;
+    delete (oobBundle as { controlRun?: PocEvidenceRun }).controlRun;
+    delete (oobBundle as { controlPath?: string }).controlPath;
+    delete (oobBundle as { controlTarget?: string }).controlTarget;
+    storePendingConfirmation(rec.id, oobBundle);
+    const rendered = formatCaseDetail(getCaseById(rec.id)!);
+    assert.ok(!rendered.includes("raw-target-token-secret"));
+    assert.ok(rendered.includes("sha256:"));
+  });
+});
+
+describe("report contract gate (confirmed → reported)", () => {
+  it("rejects unknown keys, dangling evidence ids, and unrecorded coverage refs with a typed error", () => {
+    const rec = addCase({
+      title: "Contract violations case",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "high",
+      poc: pocScriptPath("contract-poc.sh"),
+      target: "contract.test",
+      disconfirmation: "Tried; held.",
+    });
+    promote(rec.id);
+    const ctx = writeCaseContext(rec.id);
+    writeGoodReport(ctx.path);
+    writeGoodContract(rec.id, ctx.path);
+    // Corrupt the valid contract in three separate ways.
+    const base = JSON.parse(readFileSync(reportContractPathFor(ctx.path), "utf8")) as Record<
+      string,
+      unknown
+    >;
+
+    const withExtraKey = { ...base, exploit_chain: ["nope"] };
+    writeFileSync(reportContractPathFor(ctx.path), JSON.stringify(withExtraKey), "utf8");
+    assert.throws(
+      () => updateCaseResult(rec.id, { status: "reported" }),
+      (err: unknown) =>
+        err instanceof ReportContractError &&
+        err.code === "REPORT_CONTRACT_INVALID" &&
+        err.violations.some((v) => v.includes("unknown key")),
+    );
+
+    const withDanglingEvidence = { ...base, evidence_ids: ["ev_doesnotexist"] };
+    writeFileSync(reportContractPathFor(ctx.path), JSON.stringify(withDanglingEvidence), "utf8");
+    assert.throws(
+      () => updateCaseResult(rec.id, { status: "reported" }),
+      (err: unknown) =>
+        err instanceof ReportContractError && /do not exist on this case/.test(err.message),
+    );
+
+    const withDanglingCoverage = {
+      ...base,
+      coverage_refs: [{ asset: "ghost.test", class: "xss" }],
+    };
+    writeFileSync(reportContractPathFor(ctx.path), JSON.stringify(withDanglingCoverage), "utf8");
+    assert.throws(
+      () => updateCaseResult(rec.id, { status: "reported" }),
+      (err: unknown) =>
+        err instanceof ReportContractError &&
+        err.violations.some((v) => v.includes("coverage cell not recorded")),
+    );
+
+    // Restore the valid contract → the transition commits.
+    writeGoodContract(rec.id, ctx.path);
+    const done = updateCaseResult(rec.id, { status: "reported" });
+    assert.strictEqual(done.record.status, "reported");
+  });
+});
+
+describe("quorum panel pre-gate", () => {
+  const votes = (shape: ("exploit" | "not_exploit" | "inconclusive")[]) =>
+    shape.map((verdict, i) => ({
+      verdict,
+      rationale: `vote ${i}: ${verdict}`,
+      model: `panel-model-${i}`,
+      at: new Date().toISOString(),
+    }));
+
+  it("CONFIRMS without an override note when the panel reaches 2/3 exploit quorum", () => {
+    const rec = addCase({
+      title: "Quorum pass case",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "high",
+      poc: pocScriptPath("quorum-pass.sh"),
+      target: "quorum-pass.test",
+      disconfirmation: "Tried; held.",
+    });
+    const bundle = pendingBundle(rec.id);
+    bundle.panelVotes = votes(["exploit", "exploit", "not_exploit"]);
+    storePendingConfirmation(rec.id, bundle);
+    const { panel_override_note: _skip, ...cleanVerdict } = makeVerdict();
+    const result = applyConfirmationResult(
+      rec.id,
+      cleanVerdict,
+      freshMainAgentVerification(rec.id),
+    );
+    assert.strictEqual(result.record.status, "confirmed");
+    const confirmedEvent = listCaseEvents(rec.id).find((e) => e.eventType === "case_confirmed");
+    assert.strictEqual((confirmedEvent?.payload?.panel as { quorum?: boolean })?.quorum, true);
+  });
+
+  it("refuses CONFIRMED without quorum or an override note, and accepts it with the note", () => {
+    const rec = addCase({
+      title: "Quorum fail case",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "high",
+      poc: pocScriptPath("quorum-fail.sh"),
+      target: "quorum-fail.test",
+      disconfirmation: "Tried; held.",
+    });
+    // Dissenting majority: 1 exploit vs 2 not_exploit — no quorum.
+    const bundle = pendingBundle(rec.id);
+    bundle.panelVotes = votes(["exploit", "not_exploit", "not_exploit"]);
+    storePendingConfirmation(rec.id, bundle);
+    assert.throws(
+      () =>
+        applyConfirmationResult(
+          rec.id,
+          makeVerdict({ panel_override_note: undefined }),
+          freshMainAgentVerification(rec.id),
+        ),
+      /PANEL QUORUM REQUIRED/,
+    );
+    // The main agent can still commit with an explicit override note — votes
+    // are advisory-blocking, not verdict-vetoing.
+    const withNote = makeVerdict({
+      panel_override_note: "panel unavailable mid-engagement; solo confirmation documented",
+    });
+    const result = applyConfirmationResult(rec.id, withNote, freshMainAgentVerification(rec.id));
+    assert.strictEqual(result.record.status, "confirmed");
+  });
+
+  it("rejects a malformed panel at store time so it can never count as quorum", () => {
+    const rec = addCase({
+      title: "Malformed panel case",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "high",
+      poc: pocScriptPath("bad-panel.sh"),
+      target: "bad-panel.test",
+      disconfirmation: "Tried; held.",
+    });
+    const bundle = pendingBundle(rec.id);
+    (bundle as { panelVotes?: unknown }).panelVotes = [{ verdict: "exploit" }];
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /panel invalid/);
+  });
+});
+
+describe("retry policy metadata", () => {
+  it("persists, validates, and surfaces retry_policy on the record", () => {
+    const rec = addCase({ title: "Retry policy case", target: "retry.test" });
+    updateCaseResult(rec.id, {
+      retryPolicy: { max_attempts: 3, fallback_models: ["model-b", "model-c"] },
+    });
+    const stored = getCaseById(rec.id);
+    assert.deepStrictEqual(stored?.retryPolicy, {
+      max_attempts: 3,
+      fallback_models: ["model-b", "model-c"],
+    });
+    assert.ok(formatCaseDetail(stored!).includes("Retry Policy"));
+
+    // Shape is enforced on the public API path.
+    assert.throws(
+      () =>
+        updateCaseResult(rec.id, {
+          retryPolicy: { max_attempts: 99 } as CaseUpdate["retryPolicy"],
+        }),
+      /max_attempts must be an integer between 1 and 10/,
+    );
+    // Clearing is allowed (undefined falls back to existing — explicit null clears via new object).
+    const cleared = updateCaseResult(rec.id, { title: "Retry policy case (renamed)" });
+    assert.strictEqual(cleared.record.retryPolicy?.max_attempts, 3);
   });
 });
 

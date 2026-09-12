@@ -419,6 +419,36 @@ function outputWasComplete(result: { error?: Error; signal: string | null }): bo
   return !result.error && result.signal === null;
 }
 
+/**
+ * Minimal OS env copied into local PoC spawns so interpreters still resolve
+ * and run (PATH lookup, HOME/TZ/locale/temp, Windows loader vars). Everything
+ * else — proxy URLs with embedded credentials, PI_* operator secrets — stays
+ * out; the harness contract is layered on top by the caller.
+ */
+function minimalLocalEnv(): Record<string, string> {
+  const allow = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+  ];
+  const out: Record<string, string> = {};
+  for (const key of allow) {
+    const value = process.env[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
 /** Reject control characters in harness-supplied PoC env values. */
 function sanitizePocEnv(env: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -661,11 +691,15 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
       encoding: "utf8",
       timeout: TIMEOUT_MS,
       maxBuffer: MAX_BUFFER,
-      // Host runs get the harness env contract merged over the operator env;
-      // the spawn env is explicitly provided so PI_POC_MODE / PI_POC_TARGET
-      // reach the script without leaking through a shell. Same control-char
-      // rejection as the sandboxed path.
-      env: { ...process.env, ...sanitizePocEnv(runEnv) },
+      // Host runs get a MINIMAL env: OS locale/temp vars so interpreters
+      // resolve and run, plus the harness env contract — never the operator's
+      // ambient process env. Proxy URLs can embed credentials and PI_*
+      // carries operator secrets (e.g. PI_OOB_ORACLE_TOKEN bearer), and the
+      // PoC script is untrusted agent-authored code. An operator who needs a
+      // specific non-secret value for a local run injects it explicitly via
+      // the run env. The sandboxed path was already minimal (explicit -e
+      // args only).
+      env: { ...minimalLocalEnv(), ...sanitizePocEnv(runEnv) },
     });
 
     // Local runs stay shell-free (space-containing paths stay single args), so
@@ -741,15 +775,10 @@ export function runPoc(pocPath: string, options?: PocRunOptions): PocRun {
   // `local: true` means "network access needed":
   //   1. Prefer a host-network Docker sandbox (isolation retained).
   //   2. Fall back to bare host ONLY when Docker/image is unavailable AND the
-  //      operator set PI_POC_ALLOW_LOCAL=1.
-  //   3. PI_POC_FORCE_LOCAL=1 + ALLOW lets the operator (or test harness)
-  //      skip Docker and run on the host deliberately — still never agent-only.
+  //      operator set PI_POC_ALLOW_LOCAL=1. (FORCE_LOCAL+ALLOW never reaches
+  //      here — the operator escape above returns before the sandbox path.)
   if (opts.local === true) {
     const allowLocal = process.env[LOCAL_EXEC_ENV] === "1";
-    const forceLocal = process.env.PI_POC_FORCE_LOCAL === "1";
-    if (forceLocal && allowLocal) {
-      return runLocal(normalized, language, opts.env);
-    }
     const sandboxed = runSandboxed(normalized, language, "host", opts.env);
     if (!sandboxed.infraError) {
       return sandboxed;

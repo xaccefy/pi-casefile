@@ -8,7 +8,6 @@ import {
   isPublicIpAddress as harnessIsPublicIpAddress,
   replayDifferential,
   replayIntraTarget,
-  replayVerify,
 } from "../src/harness-verify.ts";
 
 /** Minimal valid evidence whose verify.url the caller overrides. */
@@ -113,29 +112,41 @@ describe("harness-verify: evaluateExpect", () => {
   });
 });
 
-describe("harness-verify: replayVerify policy", () => {
+describe("harness-verify: replay policy (via the production differential path)", () => {
   it("uses the exact shared IP classifier rather than a hand-synced copy", () => {
     assert.strictEqual(harnessIsPublicIpAddress, sharedIsPublicIpAddress);
   });
 
   it("refuses private IP literals without operator authorization", async () => {
-    const result = await replayVerify(evidence({ url: "http://127.0.0.1/read" }));
+    const result = await replayDifferential(
+      evidence({ url: "http://127.0.0.1/read" }),
+      "127.0.0.1",
+      "control.test",
+    );
     assert.strictEqual(result.attempted, false);
     assert.match(result.note, /private\/internal host/);
   });
 
   it("uses the shared classifier to reject 6to4 and Teredo literals", async () => {
-    for (const host of ["[2002:c0a8:0101::1]", "[2001:0000:4136:e378:8000:63bf:3fff:fdd2]"]) {
-      const result = await replayVerify(evidence({ url: `http://${host}/proof` }));
+    for (const host of ["2002:c0a8:0101::1", "2001:0000:4136:e378:8000:63bf:3fff:fdd2"]) {
+      const result = await replayDifferential(
+        evidence({ url: `http://[${host}]/proof` }),
+        `[${host}]`,
+        "control.test",
+      );
       assert.strictEqual(result.attempted, false, host);
       assert.match(result.note, /private\/internal/);
     }
   });
 
   it("skips localhost and .localhost hostnames", async () => {
-    for (const url of ["http://localhost/read", "http://app.localhost/read"]) {
-      const result = await replayVerify(evidence({ url }));
-      assert.strictEqual(result.attempted, false, url);
+    for (const host of ["localhost", "app.localhost"]) {
+      const result = await replayDifferential(
+        evidence({ url: `http://${host}/read` }),
+        host,
+        "control.test",
+      );
+      assert.strictEqual(result.attempted, false, host);
     }
   });
 
@@ -143,14 +154,22 @@ describe("harness-verify: replayVerify policy", () => {
     // .invalid is guaranteed NXDOMAIN (RFC 2606) — deterministic, offline.
     // The generous timeout covers slow resolvers under parallel suite load;
     // resolveHost's internal 5s cap still bounds the wait.
-    const result = await replayVerify(evidence({ url: "http://does-not-exist.invalid/read" }));
+    const result = await replayDifferential(
+      evidence({ url: "http://does-not-exist.invalid/read" }),
+      "does-not-exist.invalid",
+      "control.test",
+    );
     assert.strictEqual(result.attempted, true);
     assert.strictEqual(result.pass, false);
     assert.match(result.note, /errored/);
   });
 
-  it("skips non-http protocols instead of fetching them", async () => {
-    const result = await replayVerify(evidence({ url: "file:///etc/passwd" }));
+  it("skips non-http verify URLs (binding fails closed)", async () => {
+    const result = await replayDifferential(
+      evidence({ url: "file:///etc/passwd" }),
+      "example.com",
+      "control.test",
+    );
     assert.strictEqual(result.attempted, false);
   });
 
@@ -163,11 +182,16 @@ describe("harness-verify: replayVerify policy", () => {
         headers: { location: "http://127.0.0.1/private" },
       });
     };
-    const result = await replayVerify(evidence({ url: "http://93.184.216.34/start" }), {
-      fetchImpl,
-    });
+    const result = await replayDifferential(
+      evidence({ url: "http://93.184.216.34/start" }),
+      "93.184.216.34",
+      "control.test",
+      { fetchImpl },
+    );
     assert.strictEqual(result.pass, false);
-    assert.strictEqual(requested.length, 1, "loopback redirect must not be fetched");
+    // Each request fetches exactly once: the initial hop only — the loopback
+    // redirect Location is never fetched.
+    assert.deepStrictEqual(requested, ["http://93.184.216.34/start", "http://control.test/start"]);
     assert.match(result.note, /private\/internal host|redirect left the bound host/);
   });
 
@@ -180,14 +204,19 @@ describe("harness-verify: replayVerify policy", () => {
         headers: { location: "https://unrelated.example/proof" },
       });
     };
-    const result = await replayVerify(evidence(), { fetchImpl });
+    const result = await replayDifferential(evidence(), "example.com", "control.test", {
+      fetchImpl,
+    });
     assert.strictEqual(result.pass, false);
-    assert.deepStrictEqual(requested, ["https://example.com/read?file=/etc/passwd"]);
+    assert.deepStrictEqual(requested, [
+      "https://example.com/read?file=/etc/passwd",
+      "http://control.test/read?file=/etc/passwd",
+    ]);
     assert.match(result.note, /redirect left the bound host/);
   });
 
   it("treats a truncated response as inconclusive even if its prefix matches", async () => {
-    const result = await replayVerify(evidence(), {
+    const result = await replayDifferential(evidence(), "example.com", "control.test", {
       fetchImpl: async () => new Response(`root:${"x".repeat(2 * 1024 * 1024)}`),
     });
     assert.strictEqual(result.pass, false);

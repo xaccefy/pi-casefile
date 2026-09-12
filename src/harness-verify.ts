@@ -76,8 +76,16 @@ const REGEX_TIMEOUT_MS = 250;
 
 type ResolvedAddress = { address: string; family: 4 | 6 };
 
+/** Comparison-normalize a hostname: lowercase, strip IPv6 brackets and any trailing root dot. */
+function normHost(hostname: string): string {
+  return hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+}
+
 async function resolveHost(hostname: string): Promise<ResolvedAddress[]> {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = normHost(hostname);
   const literalFamily = isIP(host);
   if (literalFamily) return [{ address: host, family: literalFamily as 4 | 6 }];
   const lookup = dnsLookup(host, { all: true, verbatim: true }) as Promise<ResolvedAddress[]>;
@@ -116,10 +124,7 @@ function sameTargetIdentity(left: string, right: string): boolean {
   const a = parseNetworkTarget(left);
   const b = parseNetworkTarget(right);
   if (!a || !b) return false;
-  if (
-    a.url.hostname.toLowerCase().replace(/\.$/, "") !==
-    b.url.hostname.toLowerCase().replace(/\.$/, "")
-  ) {
+  if (normHost(a.url.hostname) !== normHost(b.url.hostname)) {
     return false;
   }
   if ((a.url.port || b.url.port) && effectivePort(a.url) !== effectivePort(b.url)) return false;
@@ -161,8 +166,8 @@ export function verifyUrlBindingError(verifyUrl: string, target: string): string
     return `verify.url is not parseable: ${verifyUrl}`;
   }
   if (!declared) return `target is not an HTTP network target: ${target}`;
-  const declaredHost = declared.url.hostname.toLowerCase().replace(/\.$/, "");
-  const observedHost = observed.hostname.toLowerCase().replace(/\.$/, "");
+  const declaredHost = normHost(declared.url.hostname);
+  const observedHost = normHost(observed.hostname);
   if (declaredHost !== observedHost) {
     return `verify.url host ${observedHost} does not match run target ${declaredHost}`;
   }
@@ -383,7 +388,7 @@ async function replayRequest(
     };
   }
   const signal = AbortSignal.timeout(opts?.timeoutMs ?? TIMEOUT_MS);
-  const lockedHostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  const lockedHostname = normHost(url.hostname);
   const fetchImpl = opts?.fetchImpl ?? harnessFetchForTest;
 
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
@@ -415,13 +420,11 @@ async function replayRequest(
           note: `request errored (DNS): ${url.hostname} resolved to no addresses`,
         };
       }
-    } else if (isIP(url.hostname.replace(/^\[|\]$/g, ""))) {
-      addresses = [
-        {
-          address: url.hostname.replace(/^\[|\]$/g, ""),
-          family: isIP(url.hostname.replace(/^\[|\]$/g, "")) as 4 | 6,
-        },
-      ];
+    } else {
+      const host = normHost(url.hostname);
+      if (isIP(host)) {
+        addresses = [{ address: host, family: isIP(host) as 4 | 6 }];
+      }
     }
     if (!opts?.allowPrivate && addresses.some((address) => !isPublicIpAddress(address.address))) {
       return {
@@ -470,7 +473,7 @@ async function replayRequest(
             note: `redirected to disallowed protocol ${next.protocol}`,
           };
         }
-        if (next.hostname.toLowerCase().replace(/\.$/, "") !== lockedHostname) {
+        if (normHost(next.hostname) !== lockedHostname) {
           await res.body?.cancel().catch(() => undefined);
           await fetched.close().catch(() => undefined);
           closeFetched = undefined;
@@ -606,32 +609,6 @@ function canaryResult(
     note: control
       ? `canary ${pass ? "target-only" : "failed"}: target=${String(target.canaryObserved)}, control=${String(control.canaryObserved)}`
       : `canary ${pass ? "observed" : "not observed"} on target`,
-  };
-}
-
-/**
- * Re-send the evidence's verify request with the harness's own client and
- * judge the response against verify.expect. Never throws — the outcome is a
- * structured result the ledger gate interprets.
- */
-export async function replayVerify(
-  evidence: PoCEvidence,
-  opts?: ReplayOptions,
-): Promise<HarnessVerifyResult> {
-  const token = evidence.verify.canary
-    ? `poc_canary_${randomBytes(24).toString("hex")}`
-    : undefined;
-  const verify = injectCanary(evidence.verify, token);
-  const target = await replayRequest(verify, verify.expect, token, opts);
-  const canary = canaryResult(token, target);
-  return {
-    attempted: target.attempted,
-    pass: target.matched === true,
-    status: target.status,
-    target,
-    canary,
-    proofStrength: canary?.pass ? "canary_differential" : "predicate_differential",
-    note: `harness replay: ${target.note}${canary ? `; ${canary.note}` : ""}`,
   };
 }
 

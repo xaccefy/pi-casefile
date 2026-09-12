@@ -124,6 +124,10 @@ export function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): 
     confirmerVerdict: input.confirmerVerdict ?? existing?.confirmerVerdict,
     reportedAt: input.reportedAt ?? existing?.reportedAt,
     reportPath: input.reportPath ?? existing?.reportPath,
+    retryPolicy:
+      input.retryPolicy !== undefined
+        ? normalizeRetryPolicy(input.retryPolicy)
+        : existing?.retryPolicy,
     evidenceItems: existing?.evidenceItems ?? [],
     coverageItems: existing?.coverageItems ?? [],
     linkedCases: existing?.linkedCases ?? [],
@@ -132,8 +136,78 @@ export function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): 
   };
 }
 
+/** Normalize a retry policy: attempts 1–10, at most 8 distinct fallback models. */
+export function normalizeRetryPolicy(policy: unknown): CaseRecord["retryPolicy"] {
+  if (policy === null || policy === undefined) return undefined;
+  if (typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("retry_policy must be an object: { max_attempts, fallback_models? }");
+  }
+  const p = policy as { max_attempts?: unknown; fallback_models?: unknown };
+  if (
+    typeof p.max_attempts !== "number" ||
+    !Number.isInteger(p.max_attempts) ||
+    p.max_attempts < 1 ||
+    p.max_attempts > 10
+  ) {
+    throw new Error("retry_policy.max_attempts must be an integer between 1 and 10");
+  }
+  if (p.fallback_models !== undefined && p.fallback_models !== null) {
+    if (!Array.isArray(p.fallback_models) || p.fallback_models.length > 8) {
+      throw new Error("retry_policy.fallback_models must be an array of at most 8 model names");
+    }
+    if (
+      !p.fallback_models.every(
+        (m) => typeof m === "string" && m.trim().length > 0 && m.trim() === m,
+      )
+    ) {
+      throw new Error("retry_policy.fallback_models entries must be non-empty trimmed strings");
+    }
+  }
+  const fallbackModels = Array.isArray(p.fallback_models)
+    ? Array.from(new Set(p.fallback_models.map((m) => m as string)))
+    : undefined;
+  return fallbackModels?.length
+    ? { max_attempts: p.max_attempts, fallback_models: fallbackModels }
+    : { max_attempts: p.max_attempts };
+}
+
 export function validateCase(record: CaseRecord): void {
   if (!record.title.trim()) throw new Error("Case title cannot be empty");
+  // Enum membership on the public API path: the tool layer schema-gates these,
+  // but direct callers (tests, other integrations) must not be able to persist
+  // "bogus" statuses that every later gate and reader would mis-handle.
+  const STATUS = [
+    "hypothesis",
+    "investigating",
+    "confirmed",
+    "blocked",
+    "killed",
+    "reported",
+  ] as const;
+  const CONFIDENCE = ["low", "medium", "high"] as const;
+  const SEVERITY = ["info", "low", "medium", "high", "critical"] as const;
+  const PRIORITY = ["P0", "P1", "P2", "P3", "P4"] as const;
+  if (!(STATUS as readonly string[]).includes(record.status)) {
+    throw new Error(`Invalid case status: ${record.status}. Statuses: ${STATUS.join(", ")}`);
+  }
+  if (!(CONFIDENCE as readonly string[]).includes(record.confidence)) {
+    throw new Error(
+      `Invalid case confidence: ${record.confidence}. Confidence levels: ${CONFIDENCE.join(", ")}`,
+    );
+  }
+  // Null check (not just undefined): DB reads surface absent columns as null.
+  if (record.severity != null && !(SEVERITY as readonly string[]).includes(record.severity)) {
+    throw new Error(
+      `Invalid case severity: ${record.severity}. Severities: ${SEVERITY.join(", ")}`,
+    );
+  }
+  if (record.priority != null && !(PRIORITY as readonly string[]).includes(record.priority)) {
+    throw new Error(
+      `Invalid case priority: ${record.priority}. Priorities: ${PRIORITY.join(", ")}`,
+    );
+  }
+  // Retry policy shape is machine-read by retry tooling — re-check on write.
+  if (record.retryPolicy !== undefined) normalizeRetryPolicy(record.retryPolicy);
   // Falsification conditions are load-bearing: they are required at creation
   // and must not be erasable later (CaseUpdate({ disproveIf: [] }) would wipe
   // the hypothesis's falsifiability). Re-check on every write.
@@ -226,14 +300,14 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
       references_json, blockers_json, tags_json, assumptions_json, poc_verified_json,
       disconfirmation, disconfirmation_verified_json, disprove_if_json, control_verified_json,
       pending_confirmation_json, confirmer_verdict_json,
-      reported_at, report_path, invariant, created_at, updated_at
+      reported_at, report_path, retry_policy_json, invariant, created_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?,
-      ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?
     )
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
@@ -265,6 +339,7 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
       invariant = excluded.invariant,
       reported_at = excluded.reported_at,
       report_path = excluded.report_path,
+      retry_policy_json = excluded.retry_policy_json,
       created_at = excluded.created_at,
       updated_at = excluded.updated_at
   `);
@@ -299,6 +374,7 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
     record.confirmerVerdict ? JSON.stringify(record.confirmerVerdict) : null,
     record.reportedAt || null,
     record.reportPath || null,
+    record.retryPolicy ? JSON.stringify(record.retryPolicy) : null,
     record.invariant || null,
     record.createdAt,
     record.updatedAt,
@@ -307,8 +383,8 @@ export function upsertCase(db: DatabaseSync, record: CaseRecord) {
 
 export function insertEvidenceItem(db: DatabaseSync, item: EvidenceItem): void {
   db.prepare(
-    `INSERT INTO evidence_items (id, case_id, role, artifact_path, sha256, summary, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO evidence_items (id, case_id, role, artifact_path, sha256, summary, created_at, contains_secret, secret_findings_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     item.id,
     item.caseId,
@@ -317,5 +393,43 @@ export function insertEvidenceItem(db: DatabaseSync, item: EvidenceItem): void {
     item.sha256 ?? null,
     item.summary,
     item.createdAt,
+    item.containsSecret === true ? 1 : 0,
+    item.secretFindings?.length ? JSON.stringify(item.secretFindings) : null,
+  );
+}
+
+// ── Event journal ────────────────────────────────────────────────────
+
+export type CaseEvent = {
+  caseId: string;
+  seq: number;
+  timestamp: string;
+  eventType: string;
+  actor: string;
+  payload?: Record<string, unknown>;
+};
+
+/**
+ * Append one journal event for a case. Append-only: seq is allocated as
+ * max(seq)+1 under the caller's transaction, so events land in commit order.
+ * Payloads must stay small and secret-free (field NAMES and ids, not values).
+ */
+export function appendCaseEvent(
+  db: DatabaseSync,
+  event: { caseId: string; eventType: string; actor?: string; payload?: Record<string, unknown> },
+): void {
+  const row = db
+    .prepare("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM case_events WHERE case_id = ?")
+    .get(event.caseId) as { max_seq: number } | undefined;
+  const seq = (row?.max_seq ?? 0) + 1;
+  db.prepare(
+    "INSERT INTO case_events (case_id, seq, timestamp, event_type, actor, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(
+    event.caseId,
+    seq,
+    new Date().toISOString(),
+    event.eventType,
+    event.actor ?? "agent",
+    event.payload ? JSON.stringify(event.payload) : null,
   );
 }

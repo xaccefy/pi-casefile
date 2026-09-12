@@ -9,18 +9,19 @@
  *   {project_root}/.scratchpad/{run_id}/
  *     recon/      — fingerprints, tech detection, surface maps
  *     hunt/       — per-class findings
- *     gapfil/     — gap-fill audit notes
+ *     gapfil/     — gap-fill audit notes (legacy)
  *     trace/      — per-finding reachability traces
  *     skeptic/    — adversarial disproof attempts
  *     verify/     — PoC logs, run outputs (validate phase)
  *     chain/      — exploit-chain analysis
  *     patch/      — remediation work
  *     report/     — final report context
- *     state.json  — checkpoint file with phase completion + key IDs
+ *     state.json  — legacy checkpoint file (read for context gating; the
+ *                   write-side checkpoint API was removed with the pipeline)
  *
  * Resume re-reads scratchpad artifacts; it does not re-run completed phases
  * (idempotent). The `.scratchpad/` directory is preserved between runs;
- * `--fresh` clears it via scratchpad_clear().
+ * `scratchpad_clear()` clears it for a single run.
  */
 
 import { createHash } from "node:crypto";
@@ -64,16 +65,13 @@ export interface ScratchpadCheckpoint {
 
 export interface ScratchpadResume {
   checkpoint: ScratchpadCheckpoint;
-  /** The next phase to run (or null if the run is done). */
-  next_phase: ScratchpadPhase | null;
   /** Artifact references per phase: { trace: ["finding-abc.json", ...], ... } */
   artifacts: Record<string, string[]>;
 }
 
 // ── Constants ────────────────────────────────────────────────────────
 
-// All accepted artifact buckets. Some are legacy/manual-only and should not be
-// scheduled by ScratchpadResume for new runs.
+// All accepted artifact buckets. Some are legacy/manual-only.
 export const SCRATCHPAD_PHASES: ScratchpadPhase[] = [
   "recon",
   "hunt",
@@ -83,17 +81,6 @@ export const SCRATCHPAD_PHASES: ScratchpadPhase[] = [
   "validate",
   "chain",
   "patch",
-  "report",
-];
-
-// Active pipeline order for new/resumed runs.
-export const PHASE_ORDER: ScratchpadPhase[] = [
-  "recon",
-  "hunt",
-  "trace",
-  "skeptic",
-  "validate",
-  "chain",
   "report",
 ];
 
@@ -172,57 +159,39 @@ function sanitizeName(name: string, label: string): string {
   return safe;
 }
 
-function runDirName(runId: string): string {
-  const safe = sanitizeName(runId, "run_id");
-  if (safe === runId) return safe;
-  const suffix = createHash("sha256").update(runId).digest("hex").slice(0, 12);
-  return `${safe.slice(0, 80)}-${suffix}`;
-}
-
 /**
- * Artifact names get the same disambiguation as run dirs: sanitization is
- * lossy ("a/b" and "a_b" both become "a_b"), so a changed name gets a content
- * hash suffix — distinct inputs can no longer silently overwrite each other's
- * file. Reads use the same mapping, so round-trips stay consistent.
+ * Sanitized name + disambiguation hash: sanitization is lossy ("a/b" and
+ * "a_b" both become "a_b"), so a CHANGED name gets a content hash suffix —
+ * distinct inputs can no longer silently overwrite each other's file.
+ * Reads use the same mapping, so round-trips stay consistent.
  */
-function artifactFileName(name: string): string {
-  const safe = sanitizeName(name, "artifact name");
+function sanitizeWithHashSuffix(name: string, label: string): string {
+  const safe = sanitizeName(name, label);
   if (safe === name) return safe;
   const suffix = createHash("sha256").update(name).digest("hex").slice(0, 12);
   return `${safe.slice(0, 80)}-${suffix}`;
+}
+
+function runDirName(runId: string): string {
+  return sanitizeWithHashSuffix(runId, "run_id");
+}
+
+function artifactFileName(name: string): string {
+  return sanitizeWithHashSuffix(name, "artifact name");
 }
 
 /** Cap on a single scratchpad artifact (2 MiB) — a hallucinating or hostile
  * subagent must not be able to fill the disk with unbounded writes. */
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 
-/** Pre-hash-suffix naming used by older scratchpad versions (sanitize only). */
-function legacyRunDirName(runId: string): string {
-  return sanitizeName(runId, "run_id");
-}
-
 /** The directory for a specific run. */
-export function getRunDir(runId: string, projectRoot?: string): string {
+function getRunDir(runId: string, projectRoot?: string): string {
   return join(getScratchpadRoot(projectRoot), runDirName(runId));
 }
 
 /** The state.json path for a run. */
-export function getStatePath(runId: string, projectRoot?: string): string {
+function getStatePath(runId: string, projectRoot?: string): string {
   return join(getRunDir(runId, projectRoot), "state.json");
-}
-
-function emptyCheckpoint(runId: string, projectRoot: string): ScratchpadCheckpoint {
-  const now = new Date().toISOString();
-  return {
-    run_id: runId,
-    project_root: projectRoot,
-    created_at: now,
-    last_updated: now,
-    last_phase_at: null,
-    completed_phases: [],
-    phase_ids: {} as Record<ScratchpadPhase, string[]>,
-    phase_summaries: {} as Record<ScratchpadPhase, string>,
-  };
 }
 
 function ensureRunDirs(runDir: string): void {
@@ -271,32 +240,7 @@ function readCheckpointRaw(runId: string, projectRoot?: string): ScratchpadCheck
   return cp;
 }
 
-function writeCheckpointRaw(cp: ScratchpadCheckpoint, projectRoot?: string): void {
-  cp.last_updated = new Date().toISOString();
-  const statePath = getStatePath(cp.run_id, projectRoot);
-  ensureRunDirs(getRunDir(cp.run_id, projectRoot));
-  writeSafeFileAtomic(statePath, JSON.stringify(cp, null, 2));
-}
-
 // ── Public API ───────────────────────────────────────────────────────
-
-/**
- * Initialize a new scratchpad run. Creates the directory structure and writes
- * an initial state.json. If the run already exists, returns the existing
- * checkpoint (idempotent — safe to call on resume without --fresh).
- */
-export function scratchpad_init(runId: string, projectRoot?: string): ScratchpadCheckpoint {
-  const root = projectRoot ?? detectWorkspaceRoot();
-  const runDir = getRunDir(runId, root);
-  ensureRunDirs(runDir);
-
-  const existing = readCheckpointRaw(runId, root);
-  if (existing) return existing;
-
-  const cp = emptyCheckpoint(runId, root);
-  writeCheckpointRaw(cp, root);
-  return cp;
-}
 
 /**
  * Write an artifact to a phase's subdirectory. Overwrites if the name exists.
@@ -348,37 +292,80 @@ export function scratchpad_read(
 }
 
 /**
- * List all artifacts written for a phase.
+ * A run directory discovered by direct scan — no state.json required. The slim
+ * extension surface (Write/Read/Clear only) never checkpoints, so discovery
+ * must not depend on state.json existing.
  */
-export function scratchpad_runs(projectRoot?: string): string[] {
+export type DiscoveredScratchpadRun = {
+  /** Directory name under .scratchpad (the sanitized run id). */
+  dir: string;
+  /** Artifact file names per phase bucket, non-empty buckets only. */
+  phases: Record<string, string[]>;
+};
+
+/**
+ * Scan the scratchpad root for run directories carrying artifacts. Unlike
+ * scratchpad_runs(), this lists runs WITHOUT a state.json checkpoint — the
+ * only writer of state.json (ScratchpadInit/Checkpoint) is no longer exposed
+ * as a tool, so directory scan is the primary discovery path.
+ */
+export function scratchpad_discover_artifacts(projectRoot?: string): DiscoveredScratchpadRun[] {
   const root = getScratchpadRoot(projectRoot);
   if (!existsSync(root)) return [];
   assertSafeStateDirectory(dirname(root), [SCRATCHPAD_DIR]);
-  const out: string[] = [];
+  const out: DiscoveredScratchpadRun[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
+    // Dirent.isDirectory() is lstat-based: a symlinked run dir reports as a
+    // symlink and is skipped here.
     if (!entry.isDirectory()) continue;
-    const state = join(root, entry.name, "state.json");
-    if (!assertSafeRegularFile(state, "Scratchpad checkpoint")) continue;
-    try {
-      const cp = JSON.parse(readSafeFile(state, "Scratchpad checkpoint").toString("utf8")) as {
-        run_id?: unknown;
-      };
-      if (typeof cp.run_id !== "string") continue;
-      if (getRunDir(cp.run_id, projectRoot) === join(root, entry.name)) {
-        out.push(cp.run_id);
-      } else if (join(root, legacyRunDirName(cp.run_id)) === join(root, entry.name)) {
-        // Runs created before the hash-suffix naming used sanitizeName(runId)
-        // as the directory; keep surfacing them in bundle discovery. Safe ids
-        // were never suffixed, so only legacy unsafe ids can land here.
-        out.push(cp.run_id);
+    const dir = entry.name;
+    const phases: Record<string, string[]> = {};
+    for (const phase of SCRATCHPAD_PHASES) {
+      const phaseDir = join(root, dir, PHASE_DIRS[phase]);
+      if (!existsSync(phaseDir)) continue;
+      try {
+        assertSafeStateDirectory(dirname(root), [SCRATCHPAD_DIR, dir, PHASE_DIRS[phase]]);
+      } catch {
+        continue;
       }
-    } catch {
-      // Corrupt runs are ignored during report bundle discovery; direct resume still fails closed.
+      const names = readdirSync(phaseDir).filter(
+        (f) =>
+          f !== "state.json" && assertSafeRegularFile(join(phaseDir, f), "Scratchpad artifact"),
+      );
+      if (names.length > 0) phases[phase] = names;
     }
+    if (Object.keys(phases).length > 0) out.push({ dir, phases });
   }
   return out;
 }
 
+/**
+ * Read an artifact from a DISCOVERED run directory (see
+ * scratchpad_discover_artifacts) by phase bucket key. Same safety checks as
+ * scratchpad_read, but addressed by directory name because the original run id
+ * is unrecoverable without a checkpoint.
+ */
+export function scratchpad_read_discovered(
+  dir: string,
+  phase: ScratchpadPhase,
+  artifactName: string,
+  projectRoot?: string,
+): string | null {
+  const phaseDir = PHASE_DIRS[phase];
+  if (!phaseDir) return null;
+  if (!dir || dir === "." || dir === ".." || dir.includes("/") || dir.includes("\\")) return null;
+  const root = getScratchpadRoot(projectRoot);
+  const filePath = join(root, dir, phaseDir, artifactName);
+  if (existsSync(filePath)) {
+    assertSafeStateDirectory(dirname(root), [SCRATCHPAD_DIR, dir, phaseDir]);
+  }
+  if (!assertSafeRegularFile(filePath, "Scratchpad artifact")) return null;
+  return readSafeFile(filePath, "Scratchpad artifact").toString("utf8");
+}
+
+/**
+ * List all artifacts written for a phase.
+ */
 export function scratchpad_list(
   runId: string,
   phase: ScratchpadPhase,
@@ -394,44 +381,14 @@ export function scratchpad_list(
 }
 
 /**
- * Mark a phase as complete. Records the completion timestamp, key IDs, and an
- * optional summary in state.json. Idempotent: re-checkpointing a phase
- * overwrites its previous summary/IDs but does not duplicate the entry in
- * completed_phases.
- */
-export function scratchpad_checkpoint(
-  runId: string,
-  phase: ScratchpadPhase,
-  data: { ids?: string[]; summary?: string },
-  projectRoot?: string,
-): ScratchpadCheckpoint {
-  const root = projectRoot ?? detectWorkspaceRoot();
-  const cp = readCheckpointRaw(runId, root) ?? scratchpad_init(runId, root);
-
-  if (!cp.completed_phases.includes(phase)) {
-    cp.completed_phases.push(phase);
-    // Keep completed_phases in pipeline order for predictable resume.
-    cp.completed_phases.sort((a, b) => SCRATCHPAD_PHASES.indexOf(a) - SCRATCHPAD_PHASES.indexOf(b));
-  }
-  cp.last_phase_at = new Date().toISOString();
-  if (data.ids) cp.phase_ids[phase] = data.ids;
-  if (data.summary) cp.phase_summaries[phase] = data.summary;
-
-  writeCheckpointRaw(cp, root);
-  return cp;
-}
-
-/**
- * Read the checkpoint + all artifact references for resume.
- * Returns null if the run doesn't exist.
+ * Read a legacy checkpoint (state.json) + artifact references for resume.
+ * Returns null if the run has no checkpoint — the write-side checkpoint API
+ * was removed with the pipeline; this only reads what older runs left behind.
  */
 export function scratchpad_resume(runId: string, projectRoot?: string): ScratchpadResume | null {
   const root = projectRoot ?? detectWorkspaceRoot();
   const cp = readCheckpointRaw(runId, root);
   if (!cp) return null;
-
-  // Find the next phase: the first phase in order not in completed_phases.
-  const next = PHASE_ORDER.find((p) => !cp.completed_phases.includes(p)) ?? null;
 
   // Gather artifact listing per completed phase.
   const artifacts: Record<string, string[]> = {};
@@ -439,23 +396,11 @@ export function scratchpad_resume(runId: string, projectRoot?: string): Scratchp
     artifacts[phase] = scratchpad_list(runId, phase, root);
   }
 
-  return { checkpoint: cp, next_phase: next, artifacts };
+  return { checkpoint: cp, artifacts };
 }
 
 /**
- * Check whether a phase has already been checkpointed (for idempotent re-run).
- */
-export function scratchpad_phase_done(
-  runId: string,
-  phase: ScratchpadPhase,
-  projectRoot?: string,
-): boolean {
-  const cp = readCheckpointRaw(runId, projectRoot);
-  return cp?.completed_phases.includes(phase) ?? false;
-}
-
-/**
- * Clear a specific run's scratchpad directory. Used by `--fresh` for a single
+ * Clear a specific run's scratchpad directory — a fresh start for that one
  * run. Does not touch other runs.
  */
 export function scratchpad_clear(runId: string, projectRoot?: string): void {

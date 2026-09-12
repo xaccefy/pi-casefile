@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -88,7 +89,7 @@ describe("poc-runner", () => {
       expect(result.output).toContain("PI_POC_ALLOW_LOCAL");
       expect(result.output).not.toContain("must not run on host");
     }
-  });
+  }, 60_000); // 60s budget: the docker inspect/pull path can be slow under load.
 
   it("passes the harness env contract (PI_POC_MODE / PI_POC_TARGET) to local runs", () => {
     const shPoc = join(tempDir, "poc-env.sh");
@@ -101,6 +102,39 @@ describe("poc-runner", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.output).toContain("control|http://example.test");
+  });
+
+  it("does not leak operator env (PI_* secrets, proxy vars) into local runs", () => {
+    // Local PoC scripts are untrusted agent-authored code running on the host;
+    // they must see the harness env contract + PATH, never the operator's
+    // ambient process env (proxy URLs can embed credentials; PI_OOB_ORACLE_TOKEN
+    // is a bearer secret).
+    const sentinel = `sentinel-${randomBytes(8).toString("hex")}`;
+    const previousToken = process.env.PI_OOB_ORACLE_TOKEN;
+    const previousProxy = process.env.https_proxy;
+    process.env.PI_OOB_ORACLE_TOKEN = sentinel;
+    process.env.https_proxy = "http://user:leaked-pass@proxy.example:8080";
+    const shPoc = join(tempDir, "poc-envdump.sh");
+    writeFileSync(shPoc, "#!/bin/sh\nenv\n", "utf8");
+
+    try {
+      const result = runPoc(shPoc, {
+        local: true,
+        env: { PI_POC_MODE: "control", PI_POC_TARGET: "http://example.test" },
+      });
+
+      // Exit 0 proves PATH still resolves the interpreter under the minimal env.
+      expect(result.exitCode).toBe(0);
+      expect(result.output).toContain("PI_POC_MODE=control");
+      expect(result.output).toContain("PI_POC_TARGET=http://example.test");
+      expect(result.output).not.toContain(sentinel);
+      expect(result.output).not.toContain("leaked-pass");
+    } finally {
+      if (previousToken === undefined) delete process.env.PI_OOB_ORACLE_TOKEN;
+      else process.env.PI_OOB_ORACLE_TOKEN = previousToken;
+      if (previousProxy === undefined) delete process.env.https_proxy;
+      else process.env.https_proxy = previousProxy;
+    }
   });
 
   it("uses a fresh CSPRNG-shaped evidence nonce for every run", () => {

@@ -1,14 +1,13 @@
 /**
  * Casefile — offensive security case tracker for Pi.
  *
- * Tools: CaseAdd, CaseUpdate, PromoteFinding, ConfirmFinding, EvidenceAdd, CoverageAdd, CoverageReport, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
+ * Tools: CaseAdd, CaseUpdate, PromoteFinding, ConfirmFinding, EvidenceAdd, CoverageAdd, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, ScratchpadWrite, ScratchpadRead, ScratchpadClear
  * Command: /casefile — interactive dashboard
  * Event: before_agent_start — injects the recon workflow once per session, refreshes the active case list per prompt
  */
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { type TSchema, Type } from "typebox";
@@ -16,8 +15,10 @@ import {
   CANARY_ASSESSMENT_VALUES,
   CONFIRM_DIFFERENTIAL_VALUES,
   CONFIRM_VERDICT_VALUES,
+  PANEL_VERDICT_VALUES,
   SEVERITY_MATCH_VALUES,
   validateMainAgentVerdict,
+  validatePanelVotes,
 } from "./evidence.ts";
 import {
   controlTargetAuthorizationError,
@@ -43,7 +44,6 @@ import {
   type CoverageItem,
   type CoverageScope,
   countCases,
-  coverageSummary,
   EVIDENCE_ROLE_VALUES,
   type EvidenceItem,
   type EvidenceRole,
@@ -69,8 +69,8 @@ import {
   storePendingConfirmation,
   unlinkCasesResult,
   updateCaseResult,
+  writeCaseContext,
 } from "./ledger.ts";
-import { writeCaseContext } from "./ledger.ts";
 import {
   type OobOracleConfig,
   type ProvisionedCallback,
@@ -83,13 +83,8 @@ import {
   detectWorkspaceRoot,
   SCRATCHPAD_PHASES,
   type ScratchpadPhase,
-  type ScratchpadResume,
-  scratchpad_checkpoint,
   scratchpad_clear,
-  scratchpad_init,
-  scratchpad_phase_done,
   scratchpad_read,
-  scratchpad_resume,
   scratchpad_write,
   setScratchpadRoot,
 } from "./scratchpad.ts";
@@ -144,6 +139,21 @@ const CommonFields = {
         "The security invariant this finding violates — the rule broken (e.g. 'a user cannot read another user's orders'). Confirmation checks the invariant is actually violated, not just that a request returned 200.",
     }),
   ),
+  retry_policy: Type.Optional(
+    Type.Object(
+      {
+        max_attempts: Type.Number({
+          description: "Max attempts a phase may take for this case (integer 1–10)",
+        }),
+        fallback_models: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Fallback model identifiers to try when the primary model fails (≤8)",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
+  ),
 };
 
 // ── Tool: CaseAdd ─────────────────────────────────────────────────────
@@ -184,6 +194,43 @@ const EvidenceAddSchema = Type.Object(
       Type.String({
         description:
           "Path to a regular, non-symlink artifact inside the workspace. The bytes are copied durably and stored as basename + SHA-256 (full source path is never persisted).",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+// ── Tool: CoverageAdd ─────────────────────────────────────────────────
+
+const CoverageAddSchema = Type.Object(
+  {
+    case_id: Type.String({
+      description: "Case ID (the finding case or target's main case) to record coverage under",
+    }),
+    asset: Type.String({
+      description:
+        "The asset tested — copy it verbatim from the case target where shown. For scope=wide use the deployment-wide identifier.",
+    }),
+    class: Type.String({
+      description:
+        "The attack class tested (e.g. sql-injection, xss, idor, ssti, ssrf, auth-bypass, ...).",
+    }),
+    // Provider-safe string enum (per the header rule): Type.Union(Type.Literal)
+    // serializes as anyOf/const, which some providers drop — scope would
+    // arrive undefined and every explicit 'wide' verdict would silently
+    // persist as 'local', under-reporting tested classes.
+    scope: Type.String({
+      enum: [...COVERAGE_SCOPE_VALUES],
+      description:
+        "'wide' if the verdict applies to the whole deployment/account/host (recorded ONCE, applies to every asset of the deployment — do NOT re-test it per asset); 'local' if specific to this one asset.",
+    }),
+    note: Type.String({
+      description: "Short note: techniques tried · result · key gap.",
+    }),
+    evidence_item_id: Type.Optional(
+      Type.String({
+        description:
+          "Optional artifact-backed evidence item (EvidenceAdd, on this case) backing the tested verdict. Cells without one render as unbacked.",
       }),
     ),
   },
@@ -238,6 +285,23 @@ const PromoteSchema = Type.Object(
           "Blind/OOB confirmation via the operator-run oracle (PI_OOB_ORACLE_URL). The harness provisions per-run callback tokens, injects PI_POC_CALLBACK_DOMAIN into the runs, and polls the oracle itself: promotion requires target-token interactions, ZERO control-token interactions, attested source separation (PI_OOB_SOURCE_SEPARATED=1), and self-source/missing-src_ip interactions are rejected. Without an oracle this fails closed.",
       }),
     ),
+    panel_votes: Type.Optional(
+      Type.Array(
+        Type.Object(
+          {
+            verdict: Type.String({ enum: [...PANEL_VERDICT_VALUES] }),
+            rationale: Type.String({ description: "Why this voter reached its verdict" }),
+            model: Type.String({ description: "Which model voted" }),
+            at: Type.Optional(Type.String({ description: "Vote timestamp (ISO)" })),
+          },
+          { additionalProperties: false },
+        ),
+        {
+          description:
+            "Optional pre-gate panel votes (≤5). CONFIRMED later requires a 2/3 exploit quorum or an explicit override note on the verdict; votes never commit anything.",
+        },
+      ),
+    ),
   },
   { additionalProperties: false },
 );
@@ -287,6 +351,12 @@ const ConfirmSchema = Type.Object(
           Type.String({
             description:
               "Why a causal reflection canary is not meaningful for this exploit class. Required when canary_assessment=not_applicable.",
+          }),
+        ),
+        panel_override_note: Type.Optional(
+          Type.String({
+            description:
+              "Why CONFIRMED proceeds without a 2/3 exploit panel quorum (panel skipped, unavailable, or documented disagreement). Required for CONFIRMED whenever quorum was not reached.",
           }),
         ),
         model: Type.Optional(
@@ -385,24 +455,10 @@ const ScratchpadPhaseSchema = Type.String({
     "Pipeline phase: recon | hunt | trace | skeptic | validate | chain | patch | report (legacy gapfil is accepted for older runs)",
 });
 
-/** run_id-only schema, shared by Scratchpad Init / Resume / Clear. */
+/** run_id-only schema, shared by Scratchpad tools. */
 const RunIdSchema = Type.Object(
   {
     run_id: Type.String({ description: "Pipeline run identifier" }),
-  },
-  { additionalProperties: false },
-);
-
-const ScratchpadCheckpointSchema = Type.Object(
-  {
-    run_id: Type.String({ description: "Run identifier" }),
-    phase: ScratchpadPhaseSchema,
-    ids: Type.Optional(
-      Type.Array(Type.String(), {
-        description: "Key IDs produced by this phase (case IDs, finding IDs)",
-      }),
-    ),
-    summary: Type.Optional(Type.String({ description: "One-line summary of phase completion" })),
   },
   { additionalProperties: false },
 );
@@ -424,14 +480,6 @@ const ScratchpadReadSchema = Type.Object(
     run_id: Type.String({ description: "Run identifier" }),
     phase: ScratchpadPhaseSchema,
     artifact_name: Type.String({ description: "Artifact filename to read" }),
-  },
-  { additionalProperties: false },
-);
-
-const ScratchpadPhaseDoneSchema = Type.Object(
-  {
-    run_id: Type.String({ description: "Run identifier" }),
-    phase: ScratchpadPhaseSchema,
   },
   { additionalProperties: false },
 );
@@ -733,7 +781,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
   // already-loaded extension or reveal a tool that was omitted at startup.
   const startedAsSubagent = process.env.PI_SUBAGENT_CHILD === "1";
   const isSubagentProcess = () => startedAsSubagent || process.env.PI_SUBAGENT_CHILD === "1";
-  // Pin the workspace root ONCE at extension load. Every scratchpad / pipeline
+  // Pin the workspace root ONCE at extension load. Every scratchpad
   // / PoC-path lookup otherwise re-walks the ambient cwd on each call — a
   // mid-session `cd` would split state across two .scratchpad roots and
   // misroot the hunt file-existence filter. The PoC runner reads PI_POC_ROOT
@@ -790,7 +838,13 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: AddSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const result = addCaseResult(params as CaseInput);
+      const { retry_policy, ...rest } = params as Record<string, unknown>;
+      const result = addCaseResult({
+        ...(rest as CaseInput),
+        ...(retry_policy !== undefined
+          ? { retryPolicy: retry_policy as CaseInput["retryPolicy"] }
+          : {}),
+      });
       const record = result.record;
       return {
         content: [
@@ -842,8 +896,14 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: UpdateSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { id, ...update } = params;
-      const result = updateCaseResult(id as string, update as CaseUpdate);
+      const { id, retry_policy, ...rest } = params as Record<string, unknown>;
+      const update = {
+        ...(rest as CaseUpdate),
+        ...(retry_policy !== undefined
+          ? { retryPolicy: retry_policy as CaseUpdate["retryPolicy"] }
+          : {}),
+      };
+      const result = updateCaseResult(id as string, update);
       const record = result.record;
       return {
         content: [
@@ -908,7 +968,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Evidence item recorded:\n[${item.role}] ${item.summary}${item.artifactPath ? ` — ${item.artifactPath} sha256:${item.sha256?.slice(0, 12)}…` : ""}\n\n${formatCaseDetail(record)}`,
+            text: `Evidence item recorded:\n[${item.role}] ${item.summary}${item.artifactPath ? ` — ${item.artifactPath} sha256:${item.sha256?.slice(0, 12)}…` : ""}${item.containsSecret ? `\n⚠ Artifact contains suspected secrets (${item.secretFindings?.join(", ")}) — stored and hashed, but REDACT these values in any export or report.` : ""}\n\n${formatCaseDetail(record)}`,
           },
         ],
         details: { item, record },
@@ -935,158 +995,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
         0,
         0,
       );
-    },
-  });
-
-  // ── Tool: CoverageAdd ──
-
-  const CoverageAddSchema = Type.Object(
-    {
-      case_id: Type.String({
-        description: "Case ID (the pipeline-run or finding case) to record coverage under",
-      }),
-      asset: Type.String({
-        description:
-          "The asset tested — copy it verbatim from the case target where shown. For scope=wide use the deployment-wide identifier.",
-      }),
-      class: Type.String({
-        description:
-          "The attack class tested (e.g. sql-injection, xss, idor, ssti, ssrf, auth-bypass, ...).",
-      }),
-      // Provider-safe string enum (per the header rule): Type.Union(Type.Literal)
-      // serializes to anyOf/const, which some providers drop — scope would
-      // arrive undefined and every explicit 'wide' verdict would silently
-      // persist as 'local', under-reporting tested classes.
-      scope: Type.String({
-        enum: [...COVERAGE_SCOPE_VALUES],
-        description:
-          "'wide' if the verdict applies to the whole deployment/account/host (recorded ONCE, applies to every asset of the deployment — do NOT re-test it per asset); 'local' if specific to this one asset.",
-      }),
-      note: Type.String({
-        description:
-          "Short note of the tests ACTUALLY RUN and the verdict: techniques tried · result · key gap. A verdict guessed without testing can hide a real issue.",
-      }),
-      evidence_item_id: Type.Optional(
-        Type.String({
-          description:
-            "Evidence item id backing this tested verdict (must be an artifact-backed EvidenceAdd item on this case). Cells without a backing item render as 'unbacked' in CoverageReport — 'tested' claims must be machine-checkable, not prose-only.",
-        }),
-      ),
-    },
-    { additionalProperties: false },
-  );
-
-  registerCaseTool({
-    name: "CoverageAdd",
-    label: "Record Coverage",
-    description:
-      "Record what you tested so it is not re-tested. Call AFTER finishing a CLASS of issue, for BOTH outcomes (found or clean — a clean result is just as important to record). scope=wide: the verdict is a property of the whole deployment, recorded once and applied to every later asset (do NOT re-test per asset); scope=local: specific to this one asset. The cell's existence marks that class tested for that asset.",
-    promptSnippet: "Record a tested attack class (coverage)",
-    promptGuidelines: [
-      "Record a coverage cell after you finish testing a class on an asset — found OR clean. Clean results are what make 'every class is COVERED' machine-checkable.",
-      "scope=wide for deployment-wide verdicts (record once, applies to every asset of the deployment — do NOT re-test it per asset). scope=local for single-asset verdicts.",
-      "The note must describe tests you ACTUALLY RAN, not assumptions. A verdict guessed without testing can hide a real issue.",
-      "Coverage cells live on the pipeline-run case (or the target's main case); CoverageReport shows the matrix.",
-    ],
-    parameters: CoverageAddSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const item = recordCoverageResult(params.case_id as string, {
-        asset: params.asset as string,
-        class: params.class as string,
-        scope: (params.scope ?? "local") as CoverageScope,
-        note: params.note as string,
-        evidenceItemId: params.evidence_item_id as string | undefined,
-      });
-      const record = getCaseById(params.case_id as string);
-      if (!record) throw new Error(`Case not found after coverage insert: ${params.case_id}`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Coverage recorded: [${item.scope}] ${item.asset} × ${item.class} — ${item.note}\n\n${formatCaseDetail(record)}`,
-          },
-        ],
-        details: { item, record },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(
-        theme,
-        "CoverageAdd",
-        `${(args.asset as string) ?? ""} [${(args.class as string) ?? ""}]`,
-      );
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as { item?: CoverageItem } | undefined;
-      if (!details?.item) {
-        return new Text(theme.fg("error", "✗ CoverageAdd failed"), 0, 0);
-      }
-      return new Text(
-        theme.fg("success", "✓ ") +
-          theme.fg("dim", `[${details.item.scope}] `) +
-          truncateToWidth(`${details.item.asset} × ${details.item.class}`, 50),
-        0,
-        0,
-      );
-    },
-  });
-
-  // ── Tool: CoverageReport ──
-
-  const CoverageReportSchema = Type.Object(
-    {
-      case_id: Type.String({ description: "Case ID to render the coverage matrix for" }),
-    },
-    { additionalProperties: false },
-  );
-
-  registerCaseTool({
-    name: "CoverageReport",
-    label: "Coverage Matrix",
-    description:
-      "Render the machine-checkable coverage matrix for a case: which (asset × attack-class) cells are tested, with wide-verdict propagation. Run before deciding HUNT coverage is done — the plateau stop (zero new classes testable) must be visible in the matrix, not asserted in prose.",
-    promptSnippet: "Show which attack classes were tested where",
-    promptGuidelines: [
-      "Run CoverageReport before claiming 'every class is COVERED/SKIPPED/NOT_FOUND' — the claim must match the matrix.",
-      "A class with a wide clean verdict covers every asset — do NOT re-test it per asset.",
-      "Classes tested with no cell recorded are invisible: record coverage as you finish each class (CoverageAdd).",
-    ],
-    parameters: CoverageReportSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const summary = coverageSummary(params.case_id as string);
-      const lines: string[] = [`Coverage matrix for ${params.case_id}:`];
-      for (const asset of summary.assets) {
-        lines.push(`\n## ${asset}`);
-        for (const cell of summary.byAsset[asset] ?? []) {
-          lines.push(
-            `- [${cell.scope}] ${cell.class} — ${cell.note}${cell.testedBy ? ` (by ${cell.testedBy})` : ""}` +
-              (cell.evidenceItemId
-                ? ""
-                : " ⚠ unbacked (link an artifact-backed evidence item via CoverageAdd evidence_item_id)"),
-          );
-        }
-      }
-      if (summary.items.length === 0) {
-        lines.push("\n(no coverage recorded yet — run CoverageAdd as each class is tested)");
-      }
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: { summary },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "CoverageReport", (args.case_id as string) ?? "");
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as { summary?: { items?: CoverageItem[] } } | undefined;
-      const n = details?.summary?.items?.length ?? 0;
-      return new Text(theme.fg("success", `✓ ${n} coverage cell(s)`), 0, 0);
     },
   });
 
@@ -1126,7 +1034,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         const caseId = params.id as string;
         const current = assertPromotable(caseId);
 
-        const fail = (text: string, _extra?: Record<string, unknown>): never => {
+        const fail = (text: string): never => {
           throw new Error(text);
         };
 
@@ -1137,11 +1045,19 @@ export default function casefileExtension(pi: ExtensionAPI) {
           (params.mode as string | undefined) === "intra_target" ? "intra_target" : "inter_host";
         const isIntra = mode === "intra_target";
         if (!pocPath) {
-          return fail("poc_path is REQUIRED: absolute path to the PoC script run by the harness.", {
-            missingPocPath: true,
-          });
+          return fail("poc_path is REQUIRED: absolute path to the PoC script run by the harness.");
         }
         const caseTarget = current.target ?? "";
+        // Panel votes (advisory pre-gate): validated here so a malformed panel
+        // is rejected before any sandboxed run is paid for.
+        let panelVotes: PendingConfirmation["panelVotes"];
+        if (params.panel_votes !== undefined) {
+          const parsedVotes = validatePanelVotes(params.panel_votes);
+          if (!parsedVotes.ok) {
+            return fail(`Invalid panel_votes: ${parsedVotes.error}`);
+          }
+          panelVotes = parsedVotes.votes;
+        }
         // ── OOB callback (Tier 1, opt-in for blind classes) ──
         // The operator-run oracle owns the evidence channel; the harness owns
         // the secret (per-run token, provisioned before the runs and injected
@@ -1155,7 +1071,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
         if (isIntra && oobRequested) {
           return fail(
             "mode:'intra_target' cannot be combined with oob:true — intra-target proof uses a same-host baseline request, not a callback channel. Use one or the other.",
-            { intraOobConflict: true },
           );
         }
         let oobConfig: OobOracleConfig | undefined;
@@ -1164,9 +1079,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         if (oobRequested) {
           const oracle = readOobOracleConfig();
           if (!oracle.config) {
-            return fail(`OOB CONFIRMATION UNAVAILABLE: ${oracle.error}`, {
-              oobOracleNotConfigured: true,
-            });
+            return fail(`OOB CONFIRMATION UNAVAILABLE: ${oracle.error}`);
           }
           oobConfig = oracle.config;
           // Provision both identities concurrently — each is an oracle round trip.
@@ -1182,20 +1095,17 @@ export default function casefileExtension(pi: ExtensionAPI) {
           if (!controlTarget) {
             return fail(
               "control_target is REQUIRED for inter-host mode: a distinct baseline target that lacks the vulnerability. For access-control/logic bugs use mode='intra_target' with an evidence baseline instead; for blind/OOB classes pass oob=true (with or without a control target).",
-              { missingControlTarget: true },
             );
           }
           if (controlTarget === current.target) {
             return fail(
               "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
-              { controlTargetEqualsCaseTarget: true },
             );
           }
         }
         if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
           return fail(
             "Networked PoC execution is operator-gated. Set PI_POC_ALLOW_NETWORK=1 to authorize the host-network sandbox for this session.",
-            { networkNotAuthorized: true },
           );
         }
         if (!isIntra && !oobOnly) {
@@ -1204,7 +1114,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
             return fail(
               `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
                 "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
-              { controlNotAuthorized: true },
             );
           }
         }
@@ -1215,9 +1124,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         try {
           pocHash = createHash("sha256").update(readFileSync(pocPath)).digest("hex");
         } catch (e) {
-          return fail(`Cannot read PoC script: ${(e as Error).message}`, {
-            sameFileCheckFailed: true,
-          });
+          return fail(`Cannot read PoC script: ${(e as Error).message}`);
         }
         if (!isIntra && !oobOnly) {
           let controlHash: string | undefined;
@@ -1226,13 +1133,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
           } catch (e) {
             return fail(
               `Cannot read control script for the same-file check: ${(e as Error).message}`,
-              { sameFileCheckFailed: true },
             );
           }
           if (pocHash !== controlHash) {
             return fail(
               "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
-              { controlHashMismatch: true },
             );
           }
         }
@@ -1269,7 +1174,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
               `${mode} run did not complete or output capture was incomplete` +
                 (r.infraError ? ` (infra: ${r.output.trim()})` : "") +
                 ". A crash is not evidence. Case remains investigating.",
-              { run: r, pocCrashed: true },
             );
           }
           if (r.evidenceError) {
@@ -1277,13 +1181,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
               `EVIDENCE CONTRACT FAILED (${mode} run): ${r.evidenceError}. ` +
                 "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains / body_regex } }, observations }; a response-body assertion is mandatory — " +
                 "the file is bound to this run and validated by the harness. Case remains investigating.",
-              { run: r, evidenceError: r.evidenceError },
             );
           }
           if (!r.evidence || !r.evidenceSha256 || !r.nonce) {
-            return fail(`${mode} run produced no evidence. Case remains investigating.`, {
-              run: r,
-            });
+            return fail(`${mode} run produced no evidence. Case remains investigating.`);
           }
           return {
             mode,
@@ -1313,7 +1214,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
         if (oobRequested && targetRuns.some((r) => r.evidence.verify.canary !== undefined)) {
           return fail(
             "verify.canary cannot be combined with oob:true — the per-run callback token already provides a harness-owned causality signal. Remove the {{PI_POC_CANARY}} placeholder and verify.canary from evidence.json, then re-promote.",
-            { canaryOobConflict: true },
           );
         }
         const allowPrivateReplay = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
@@ -1327,13 +1227,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
           if (ev0.verify.mode !== "intra_target") {
             return fail(
               "INTRA-TARGET FAILED: the PoC's evidence.json must set verify.mode='intra_target' when promoting in intra-target mode.",
-              { intraModeMismatch: true },
             );
           }
           if (!ev0.baseline) {
             return fail(
               "INTRA-TARGET FAILED: evidence.json must include a baseline — a legitimate same-host request whose response must NOT satisfy the attack predicate.",
-              { intraBaselineMissing: true },
             );
           }
           harnessVerified = await replayIntraTarget(ev0, caseTarget, {
@@ -1377,6 +1275,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
           mode,
           targetRuns,
           harnessVerified,
+          ...(panelVotes ? { panelVotes } : {}),
           ...(callbackVerified && targetCallback && controlCallback
             ? {
                 callbackVerified,
@@ -1393,9 +1292,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         try {
           record = storePendingConfirmation(caseId, bundle);
         } catch (e) {
-          return fail(`Pending confirmation rejected: ${(e as Error).message}`, {
-            storeRejected: true,
-          });
+          return fail(`Pending confirmation rejected: ${(e as Error).message}`);
         }
 
         return {
@@ -1601,6 +1498,65 @@ ${formatCaseDetail(record)}`,
         );
       },
     });
+
+  // ── Tool: CoverageAdd ──
+
+  registerCaseTool({
+    name: "CoverageAdd",
+    label: "Record Coverage Cell",
+    description:
+      "Record a tested (asset × attack-class) coverage cell on a case — for BOTH outcomes (found or clean). Clean results make 'every class is covered' machine-checkable. scope='wide' records a deployment-wide verdict ONCE (do not re-test per asset); 'local' is asset-specific. Cells can carry an artifact-backed evidence item; unbacked cells render as such in the report contract gate.",
+    promptSnippet: "Record a tested coverage cell (found or clean)",
+    promptGuidelines: [
+      "Use CoverageAdd whenever you finish testing a class on an asset — a clean 'no injection on /api/orders' verdict is just as load-bearing as a finding.",
+      "scope='wide' when the verdict is a property of the whole deployment (record once — do NOT re-test per asset); scope='local' for one asset.",
+      "Reference an artifact-backed EvidenceAdd item via evidence_item_id so the tested verdict is machine-checkable, not prose-only.",
+    ],
+    parameters: CoverageAddSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const item = recordCoverageResult(params.case_id as string, {
+        asset: params.asset as string,
+        class: params.class as string,
+        scope: params.scope as CoverageScope,
+        note: params.note as string,
+        evidenceItemId: params.evidence_item_id as string | undefined,
+      });
+      const record = getCaseById(params.case_id as string);
+      if (!record) throw new Error(`Case not found after coverage insert: ${params.case_id}`);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Coverage cell recorded:\n[${item.scope}] ${item.asset} × ${item.class} — ${item.note}${item.evidenceItemId ? ` (backed by ${item.evidenceItemId})` : " (unbacked — attach an EvidenceAdd item to make it machine-checkable)"}\n\n${formatCaseDetail(record)}`,
+          },
+        ],
+        details: { item, record },
+      };
+    },
+
+    renderCall(args, theme) {
+      return callLine(
+        theme,
+        "CoverageAdd",
+        `${(args.case_id as string) ?? ""} ${(args.asset as string) ?? ""}×${(args.class as string) ?? ""}`,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { item?: CoverageItem } | undefined;
+      if (!details?.item) {
+        return new Text(theme.fg("error", "✗ CoverageAdd failed"), 0, 0);
+      }
+      return new Text(
+        theme.fg("success", "✓ ") +
+          theme.fg("dim", `[${details.item.scope}] `) +
+          truncateToWidth(`${details.item.asset} × ${details.item.class}`, 60),
+        0,
+        0,
+      );
+    },
+  });
 
   // ── Tool: CaseGet ──
 
@@ -1831,15 +1787,15 @@ ${formatCaseDetail(record)}`,
     parameters: IdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { path, contextPath, record } = writeCaseContext(params.id as string);
+      const { path, contextPath, contractPath, record } = writeCaseContext(params.id as string);
       return {
         content: [
           {
             type: "text",
-            text: `Case context written: ${contextPath}\nReport path: ${path}\n${formatCase(record)}`,
+            text: `Case context written: ${contextPath}\nReport path: ${path}\nReport contract path: ${contractPath} — write the closed-schema JSON contract there (evidence_ids + coverage_refs must reference only this case's items); status='reported' is rejected until it validates.\n${formatCase(record)}`,
           },
         ],
-        details: { path, contextPath, record },
+        details: { path, contextPath, contractPath, record },
       };
     },
 
@@ -1857,153 +1813,6 @@ ${formatCaseDetail(record)}`,
     },
   });
 
-  // ── Tool: ScratchpadInit ──
-
-  registerCaseTool({
-    name: "ScratchpadInit",
-    label: "Init Scratchpad",
-    description:
-      "Initialize a crash-recoverable artifact store for a pipeline run. Creates the directory structure and an initial state.json checkpoint. Idempotent — safe to call on resume without --fresh; returns the existing checkpoint if the run already exists.",
-    promptSnippet: "Initialize the pipeline artifact store for a run",
-    promptGuidelines: [
-      "Call ScratchpadInit once at the start of a pipeline run (or on resume before ScratchpadResume).",
-      "The run_id is arbitrary but should be unique per pipeline run — typically <target>-<timestamp>.",
-      "On resume, ScratchpadInit returns the existing checkpoint without wiping it; pair with ScratchpadResume to skip completed phases.",
-    ],
-    parameters: RunIdSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const cp = scratchpad_init(params.run_id as string);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Scratchpad initialized for run ${cp.run_id}.\nCompleted phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}`,
-          },
-        ],
-        details: { checkpoint: cp },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "ScratchpadInit", (args.run_id as string) ?? "");
-    },
-
-    renderResult(result, _opts, theme) {
-      const cp = (result.details as { checkpoint: { run_id: string } } | undefined)?.checkpoint;
-      return new Text(`${theme.fg("success", "✓ ")}ScratchpadInit ${cp?.run_id ?? ""}`, 0, 0);
-    },
-  });
-
-  // ── Tool: ScratchpadResume ──
-
-  registerCaseTool({
-    name: "ScratchpadResume",
-    label: "Resume Scratchpad",
-    description:
-      "Read the checkpoint and artifact listing for a pipeline run to decide where to resume. Returns the next phase to run (or null if done) and which phases already completed. Returns null if the run does not exist.",
-    promptSnippet: "Check pipeline resume state — which phases are done",
-    promptGuidelines: [
-      "Call ScratchpadResume at pipeline start to determine where to resume. If it returns a checkpoint, skip completed phases (check ScratchpadPhaseDone before each dispatch) and continue from next_phase.",
-      "If ScratchpadResume returns null, the run has no checkpoint — call ScratchpadInit to start fresh.",
-      "Use ScratchpadPhaseDone before dispatching each stage to avoid re-running completed phases (idempotent resume).",
-    ],
-    parameters: RunIdSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const resume = scratchpad_resume(params.run_id as string);
-      if (!resume) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No scratchpad found for run ${params.run_id}. Call ScratchpadInit to start a new run.`,
-            },
-          ],
-          details: { resume: null },
-        };
-      }
-      const cp = resume.checkpoint;
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Resume run ${cp.run_id}:\n` +
-              `Completed phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}\n` +
-              `Next phase: ${resume.next_phase ?? "none (run is done)"}`,
-          },
-        ],
-        details: { resume },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "ScratchpadResume", (args.run_id as string) ?? "");
-    },
-
-    renderResult(result, _opts, theme) {
-      const resume = (result.details as { resume: ScratchpadResume | null } | undefined)?.resume;
-      if (!resume) return new Text(theme.fg("warning", "↷ ScratchpadResume — no run found"), 0, 0);
-      return new Text(
-        theme.fg("success", "✓ ") +
-          `ScratchpadResume ${resume.checkpoint.run_id} → next: ${resume.next_phase ?? "done"}`,
-        0,
-        0,
-      );
-    },
-  });
-
-  // ── Tool: ScratchpadCheckpoint ──
-
-  registerCaseTool({
-    name: "ScratchpadCheckpoint",
-    label: "Checkpoint Phase",
-    description:
-      "Mark a pipeline phase as complete in the scratchpad state.json. Records the completion timestamp, key IDs, and an optional summary. Idempotent — re-checkpointing a phase overwrites its summary/IDs without duplicating the completed_phases entry.",
-    promptSnippet: "Record a pipeline phase as complete",
-    promptGuidelines: [
-      "Call ScratchpadCheckpoint after every phase completes: ScratchpadCheckpoint(run_id, phase, { ids, summary }).",
-      "ids are the key case/finding IDs the phase produced — used by resume to reconstruct state.",
-      "Keep completed_phases in pipeline order; the checkpoint sorts automatically.",
-    ],
-    parameters: ScratchpadCheckpointSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const cp = scratchpad_checkpoint(params.run_id as string, params.phase as ScratchpadPhase, {
-        ids: params.ids as string[] | undefined,
-        summary: params.summary as string | undefined,
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Phase ${params.phase} checkpointed for run ${cp.run_id}.\n` +
-              `Completed phases: ${cp.completed_phases.join(", ")}`,
-          },
-        ],
-        details: { checkpoint: cp },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "ScratchpadCheckpoint", `${args.run_id ?? ""} ${args.phase ?? ""}`);
-    },
-
-    renderResult(result, _opts, theme) {
-      const cp = (
-        result.details as { checkpoint: { run_id: string; completed_phases: string[] } } | undefined
-      )?.checkpoint;
-      return new Text(
-        theme.fg("success", "✓ ") +
-          `ScratchpadCheckpoint ${cp?.run_id ?? ""} — ${cp?.completed_phases.length ?? 0} phases done`,
-        0,
-        0,
-      );
-    },
-  });
-
   // ── Tool: ScratchpadWrite ──
 
   registerCaseTool({
@@ -2011,7 +1820,7 @@ ${formatCaseDetail(record)}`,
     label: "Write Artifact",
     description:
       "Write an intermediate artifact (recon map, trace output, verification log) to a phase's subdirectory in the scratchpad. Overwrites if the name exists. Artifact names are sanitized — path traversal is blocked.",
-    promptSnippet: "Save a pipeline artifact to the scratchpad",
+    promptSnippet: "Save a run artifact to the scratchpad",
     promptGuidelines: [
       "Agents write artifacts to the scratchpad, not to each other's output files (prevents an echo chamber).",
       "The casefile owns state transitions; the scratchpad owns artifacts. Use ScratchpadWrite for bulky intermediate outputs, not CaseUpdate.",
@@ -2057,7 +1866,7 @@ ${formatCaseDetail(record)}`,
     label: "Read Artifact",
     description:
       "Read an artifact from a phase's subdirectory in the scratchpad. Returns null if the artifact is missing. Use to resume a phase from a prior run's intermediate output.",
-    promptSnippet: "Read a pipeline artifact from the scratchpad",
+    promptSnippet: "Read a run artifact from the scratchpad",
     promptGuidelines: [
       "On resume, ScratchpadRead retrieves a prior phase's intermediate output so the next phase can proceed without re-running it.",
       "Returns null for missing artifacts — treat as 'not yet produced' rather than an error.",
@@ -2107,60 +1916,16 @@ ${formatCaseDetail(record)}`,
     },
   });
 
-  // ── Tool: ScratchpadPhaseDone ──
-
-  registerCaseTool({
-    name: "ScratchpadPhaseDone",
-    label: "Phase Done?",
-    description:
-      "Check whether a phase has already been checkpointed in the scratchpad — for idempotent re-run. Returns true if the phase is complete; skip re-dispatching it on resume.",
-    promptSnippet: "Check if a pipeline phase is already complete",
-    promptGuidelines: [
-      "Call ScratchpadPhaseDone before dispatching each stage to avoid re-running completed phases on resume.",
-      "A completed phase with a checkpoint is a no-op on re-run — skip it and continue to the next incomplete phase.",
-    ],
-    parameters: ScratchpadPhaseDoneSchema,
-
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const done = scratchpad_phase_done(params.run_id as string, params.phase as ScratchpadPhase);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Phase ${params.phase} for run ${params.run_id}: ${done ? "DONE (skip on resume)" : "not done"}`,
-          },
-        ],
-        details: { phase: params.phase, done },
-      };
-    },
-
-    renderCall(args, theme) {
-      return callLine(theme, "ScratchpadPhaseDone", `${args.run_id ?? ""} ${args.phase ?? ""}`);
-    },
-
-    renderResult(result, _opts, theme) {
-      const done = (result.details as { done?: boolean } | undefined)?.done;
-      return new Text(
-        done
-          ? theme.fg("success", "✓ ScratchpadPhaseDone — done")
-          : theme.fg("warning", "↷ ScratchpadPhaseDone — not done"),
-        0,
-        0,
-      );
-    },
-  });
-
   // ── Tool: ScratchpadClear ──
 
   registerCaseTool({
     name: "ScratchpadClear",
     label: "Clear Run",
     description:
-      "Clear a single pipeline run's scratchpad directory. Used by --fresh for one run. Does not touch other runs. The run must be re-initialized with ScratchpadInit afterward.",
-    promptSnippet: "Clear one pipeline run's artifacts",
+      "Clear a single run's scratchpad directory to force a fresh start for that run. Does not touch other runs. Directories are recreated automatically on the next write.",
+    promptSnippet: "Clear one run's artifacts",
     promptGuidelines: [
-      "Use ScratchpadClear to force a fresh start for a single run (--fresh). It deletes that run's directory only.",
-      "After clearing, call ScratchpadInit to recreate the directory structure before writing artifacts.",
+      "Use ScratchpadClear to force a fresh start for a single run. It deletes that run's directory only.",
     ],
     parameters: RunIdSchema,
 
@@ -2170,7 +1935,7 @@ ${formatCaseDetail(record)}`,
         content: [
           {
             type: "text",
-            text: `Scratchpad cleared for run ${params.run_id}. Call ScratchpadInit to start a new run.`,
+            text: `Scratchpad cleared for run ${params.run_id}.`,
           },
         ],
         details: { run_id: params.run_id, cleared: true },

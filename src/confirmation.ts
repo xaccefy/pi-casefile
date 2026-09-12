@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, statSync } from "node:fs";
 
 import { basename } from "node:path";
 
@@ -25,8 +25,11 @@ import {
   evidenceNonceMatches,
   type MainAgentVerdict,
   normalizeEvidence,
+  panelQuorumReached,
   parsePoCEvidence,
+  scanArtifactForSecrets,
   validateMainAgentVerdict,
+  validatePanelVotes,
 } from "./evidence.ts";
 import { type HarnessVerifyResult, sameRequest, verifyUrlBindingError } from "./harness-verify.ts";
 import type {
@@ -41,9 +44,11 @@ import type {
 } from "./ledger.ts";
 import { getCaseById, readWorkspaceArtifact } from "./ledger.ts";
 import {
+  appendCaseEvent,
   buildRecord,
   getDb,
   insertEvidenceItem,
+  stableShortId,
   upsertCase,
   validateCase,
   withImmediateTransaction,
@@ -58,10 +63,159 @@ const PROCESS_STARTED_AS_SUBAGENT = process.env.PI_SUBAGENT_CHILD === "1";
 /** Pending confirmation expires after 1h — re-run PromoteFinding for a fresh bundle. */
 export const PENDING_CONFIRM_TTL_MS = 60 * 60 * 1000;
 
-// Re-declared here as narrow internal helpers; ledger.ts keeps the shared copies.
-function stableShortId(input: string): string {
-  return createHash("sha1").update(input).digest("hex").slice(0, 10);
+// ── Report contract gate (confirmed → reported) ──────────────────────
+
+/** Typed, fail-closed error for an invalid report contract. */
+export class ReportContractError extends Error {
+  readonly code = "REPORT_CONTRACT_INVALID";
+  readonly violations: string[];
+
+  constructor(violations: string[]) {
+    super(
+      `report contract invalid (${violations.length} violation(s)):\n- ${violations.join("\n- ")}`,
+    );
+    this.name = "ReportContractError";
+    this.violations = violations;
+  }
 }
+
+/** The closed-schema contract companion path for a report markdown path. */
+export function reportContractPathFor(reportPath: string): string {
+  return reportPath.replace(/\.md$/i, ".contract.json");
+}
+
+/** Hard cap on the contract document — it is metadata, not a report carrier. */
+const REPORT_CONTRACT_MAX_BYTES = 64 * 1024;
+
+/** Keys the closed schema accepts; anything else is a violation. */
+const REPORT_CONTRACT_KEYS = new Set([
+  "case_id",
+  "title",
+  "severity",
+  "summary",
+  "impact",
+  "remediation",
+  "steps",
+  "evidence_ids",
+  "coverage_refs",
+]);
+
+/**
+ * Validate the closed-schema report contract for a confirmed case:
+ * - a regular, non-symlink JSON file of bounded size exists at contractPath;
+ * - only schema keys are present, and the required text fields are non-empty;
+ * - evidence_ids reference ONLY evidence items that exist on this case, and
+ *   include at least one observation and one reproduction item;
+ * - coverage_refs reference ONLY (asset, class) cells recorded on this case.
+ *
+ * Throws ReportContractError (fail closed) on any violation.
+ */
+export function validateReportContract(record: CaseRecord, contractPath: string): void {
+  const violations: string[] = [];
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(contractPath);
+  } catch {
+    throw new ReportContractError([
+      `report contract not found: ${basename(contractPath)} (write the closed-schema JSON contract next to the report, then retry status='reported')`,
+    ]);
+  }
+  if (!stat.isFile()) violations.push("report contract path is not a regular file");
+  if (lstatSync(contractPath).isSymbolicLink()) {
+    violations.push("report contract must not be a symbolic link");
+  }
+  if (stat.size > REPORT_CONTRACT_MAX_BYTES) {
+    violations.push(
+      `report contract too large (${stat.size} bytes; max ${REPORT_CONTRACT_MAX_BYTES})`,
+    );
+  }
+  if (violations.length > 0) throw new ReportContractError(violations);
+
+  let doc: unknown;
+  try {
+    doc = JSON.parse(readFileSync(contractPath, "utf8"));
+  } catch (e) {
+    throw new ReportContractError([`report contract is not valid JSON: ${(e as Error).message}`]);
+  }
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
+    throw new ReportContractError(["report contract must be a JSON object"]);
+  }
+  const contract = doc as Record<string, unknown>;
+  for (const key of Object.keys(contract)) {
+    if (!REPORT_CONTRACT_KEYS.has(key)) {
+      violations.push(`unknown key "${key}" — the report contract schema is closed`);
+    }
+  }
+  for (const required of ["case_id", "title", "severity", "summary", "impact", "remediation"]) {
+    const v = contract[required];
+    if (typeof v !== "string" || v.trim().length === 0) {
+      violations.push(`"${required}" must be a non-empty string`);
+    }
+  }
+  if (contract.case_id !== record.id) {
+    violations.push(`"case_id" must be ${record.id} (got ${String(contract.case_id)})`);
+  }
+  const SEVERITIES = ["info", "low", "medium", "high", "critical"];
+  if (
+    typeof contract.severity === "string" &&
+    !(record.severity
+      ? contract.severity === record.severity
+      : SEVERITIES.includes(contract.severity))
+  ) {
+    violations.push(
+      `"severity" must match the case severity (${record.severity ?? "unset"}) or be a valid severity`,
+    );
+  }
+  if (!Array.isArray(contract.steps) || contract.steps.length === 0) {
+    violations.push('"steps" must be a non-empty array of reproduction steps');
+  } else if (!contract.steps.every((s: unknown) => typeof s === "string" && s.trim().length > 0)) {
+    violations.push('"steps" entries must be non-empty strings');
+  }
+
+  const items = record.evidenceItems ?? [];
+  const knownIds = new Set(items.map((i) => i.id));
+  const evidenceIds = contract.evidence_ids;
+  if (!Array.isArray(evidenceIds) || evidenceIds.length === 0) {
+    violations.push('"evidence_ids" must be a non-empty array of evidence item ids');
+  } else {
+    if (!evidenceIds.every((id: unknown) => typeof id === "string" && knownIds.has(id))) {
+      violations.push('"evidence_ids" references evidence items that do not exist on this case');
+    }
+    const referenced = items.filter((i) => evidenceIds.includes(i.id));
+    if (!referenced.some((i) => i.role === "observation")) {
+      violations.push('"evidence_ids" must include at least one observation item');
+    }
+    if (!referenced.some((i) => i.role === "reproduction")) {
+      violations.push('"evidence_ids" must include at least one reproduction item');
+    }
+  }
+
+  const coverageRefs = contract.coverage_refs;
+  if (coverageRefs !== undefined && !Array.isArray(coverageRefs)) {
+    violations.push('"coverage_refs" must be an array of { asset, class } objects');
+  } else if (Array.isArray(coverageRefs)) {
+    const cells = new Set((record.coverageItems ?? []).map((c) => `${c.asset}\n${c.class}`));
+    for (const [index, ref] of coverageRefs.entries()) {
+      if (
+        typeof ref !== "object" ||
+        ref === null ||
+        typeof (ref as Record<string, unknown>).asset !== "string" ||
+        typeof (ref as Record<string, unknown>).class !== "string"
+      ) {
+        violations.push(`"coverage_refs[${index}]" must be an { asset, class } object`);
+      } else if (
+        !cells.has(`${(ref as { asset: string }).asset}\n${(ref as { class: string }).class}`)
+      ) {
+        violations.push(
+          `"coverage_refs[${index}]" references a coverage cell not recorded on this case`,
+        );
+      }
+    }
+  }
+
+  if (violations.length > 0) throw new ReportContractError(violations);
+}
+
 function validateRunEvidence(run: PocEvidenceRun, label: string): void {
   if (!run.completed) {
     throw new Error(`${label} did not complete; a crash is not evidence`);
@@ -392,9 +546,21 @@ export function storePendingConfirmation(id: string, bundle: PendingConfirmation
       );
     }
     if (bundle.caseId !== id) throw new Error("Pending confirmation caseId mismatch");
+    // Panel vote shape is machine-checked at store time — a malformed panel
+    // must never silently count toward a quorum later.
+    if (bundle.panelVotes !== undefined) {
+      const votes = validatePanelVotes(bundle.panelVotes);
+      if (!votes.ok) throw new Error(`Pending confirmation panel invalid: ${votes.error}`);
+    }
     if (bundle.mode === "intra_target") {
       const next = validateIntraTargetBundle(current, id, bundle);
       upsertCase(db, next);
+      appendCaseEvent(db, {
+        actor: "harness",
+        caseId: id,
+        eventType: "promotion_pending",
+        payload: { mode: "intra_target", evidence_sha256: bundle.targetRuns[0].evidenceSha256 },
+      });
       return next;
     }
     // Control-run requirements key off controlRun PRESENCE, not the OOB flag:
@@ -493,6 +659,15 @@ export function storePendingConfirmation(id: string, bundle: PendingConfirmation
     const next = buildRecord({ pendingConfirmation: bundle }, current);
     validateCase(next);
     upsertCase(db, next);
+    appendCaseEvent(db, {
+      actor: "harness",
+      caseId: id,
+      eventType: "promotion_pending",
+      payload: {
+        mode: bundle.callbackVerified?.attempted ? "oob" : "inter_host",
+        evidence_sha256: bundle.targetRuns[0].evidenceSha256,
+      },
+    });
     return next;
   });
 }
@@ -557,6 +732,18 @@ export function applyConfirmationResult(
           "CONFIRMED canary mismatch: this evidence has no canary template; record canary_assessment=not_applicable and explain why",
         );
       }
+      // Quorum panel pre-gate: CONFIRMED needs a 2/3 exploit panel or an
+      // explicit override note recording why the panel was skipped (or
+      // overruled). Votes are advisory — the main agent still commits — but a
+      // non-quorum CONFIRMED without a note is refused.
+      const quorum = panelQuorumReached(bundle.panelVotes);
+      if (!quorum.quorum && !verdict.panel_override_note?.trim()) {
+        throw new Error(
+          `PANEL QUORUM REQUIRED: CONFIRMED needs either a 2/3 exploit panel (got ${quorum.exploit} exploit / ${quorum.total} vote(s)) ` +
+            "or an explicit panel_override_note recording why the panel was skipped or overruled. " +
+            "Re-run PromoteFinding with panel_votes, or justify the solo confirmation in panel_override_note.",
+        );
+      }
     }
     const recorded: MainAgentVerdictRecord = {
       ...verdict,
@@ -594,6 +781,12 @@ export function applyConfirmationResult(
       next.pendingConfirmation = undefined;
       validateCase(next);
       upsertCase(db, next);
+      appendCaseEvent(db, {
+        caseId: id,
+        actor: "main_agent",
+        eventType: "confirmation_verdict",
+        payload: { verdict: verdict.verdict, model: verdict.model ?? null },
+      });
       return { record: next, changed: true };
     }
 
@@ -665,6 +858,22 @@ export function applyConfirmationResult(
       summary: `PoC evidence accepted (2 target runs + ${isIntra ? "same-host baseline" : "control"}; ${recorded.proofStrength}) — main agent semantic confirmation${verdict.model ? ` (${verdict.model})` : ""}`,
       createdAt: targetRun.ranAt,
     };
+    // Defense in depth: the run's evidence.json may embed secrets in
+    // observations/claim text — flag it like any other artifact.
+    if (targetRun.evidencePath) {
+      try {
+        const secretFindings = scanArtifactForSecrets(
+          readWorkspaceArtifact(targetRun.evidencePath).bytes,
+        );
+        if (secretFindings.length > 0) {
+          reproductionItem.containsSecret = true;
+          reproductionItem.secretFindings = secretFindings;
+        }
+      } catch {
+        // validateRunEvidence already proved the artifact readable; a scan
+        // failure never blocks the confirmation itself.
+      }
+    }
 
     const newEvidence =
       (current.evidence ? `${current.evidence}\n\n` : "") +
@@ -723,6 +932,19 @@ export function applyConfirmationResult(
     validateCase(next);
     insertEvidenceItem(db, reproductionItem);
     upsertCase(db, next);
+    appendCaseEvent(db, {
+      caseId: id,
+      actor: "main_agent",
+      eventType: "case_confirmed",
+      payload: {
+        verdict: "CONFIRMED",
+        proof_strength: recorded.proofStrength ?? null,
+        model: verdict.model ?? null,
+        panel: panelQuorumReached(bundle.panelVotes),
+        override: verdict.panel_override_note ? true : false,
+        reproduction_evidence_id: reproductionItem.id,
+      },
+    });
     next.evidenceItems = [...(next.evidenceItems ?? []), reproductionItem];
     return { record: next, changed: true };
   });

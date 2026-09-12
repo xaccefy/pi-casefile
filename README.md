@@ -26,10 +26,11 @@ Designed for **human + AI workflows**: every confirmed finding carries a reprodu
 
 | Tool | Purpose |
 |---|---|
-| `CaseAdd` / `CaseList` / `CaseUpdate` / `CaseContext` | case lifecycle and context retrieval |
+| `CaseAdd` / `CaseList` / `CaseSearch` / `CaseGet` / `CaseUpdate` / `CaseLink` / `CaseUnlink` / `CaseContext` | case lifecycle, search, links, and report context |
 | `EvidenceAdd` | attach raw evidence to a case |
+| `CoverageAdd` | record tested (asset × class) cells — found or clean |
 | `PromoteFinding` → harness replay → `ConfirmFinding` | gated finding pipeline |
-| Scratchpad | phase-scoped working notes, resume-safe |
+| `ScratchpadWrite` / `ScratchpadRead` / `ScratchpadClear` | working notes, resume-safe (no pipeline orchestration) |
 
 ## Install
 
@@ -43,7 +44,7 @@ Peer-depends on a Pi-compatible agent host (`@earendil-works/pi-coding-agent`, `
 
 ```bash
 bun install
-bun test --isolate   # 222 tests
+bun test --isolate
 bun run typecheck
 ```
 
