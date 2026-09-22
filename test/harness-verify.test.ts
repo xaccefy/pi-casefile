@@ -1,12 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { isPublicIpAddress as sharedIsPublicIpAddress } from "@xaccefy/pi-shared";
 import { type PoCEvidence, parsePoCEvidence } from "../src/evidence.ts";
-import {
-  evaluateExpect,
-  isPublicIpAddress as harnessIsPublicIpAddress,
-  replayIntraTarget,
-} from "../src/harness-verify.ts";
+import { evaluateExpect, replayIntraTarget } from "../src/harness-verify.ts";
 
 const DEFAULT_BASELINE: PoCEvidence["baseline"] = {
   method: "GET",
@@ -102,40 +97,50 @@ describe("harness-verify: evaluateExpect", () => {
 });
 
 describe("harness-verify: replay policy (via the production differential path)", () => {
-  it("uses the exact shared IP classifier rather than a hand-synced copy", () => {
-    assert.strictEqual(harnessIsPublicIpAddress, sharedIsPublicIpAddress);
-  });
-
-  it("refuses private IP literals without operator authorization", async () => {
+  it("replays loopback/private literals without an authorization gate", async () => {
+    // The operator-authorization gate was removed: a loopback literal now
+    // replays like any other target (still DNS/pin/binding-checked).
+    const fetchImpl = async (input: string | URL) =>
+      new Response(String(input).includes("/read") ? "root:x:0:0" : "not found", { status: 200 });
     const result = await replayIntraTarget(
       evidence({ url: "http://127.0.0.1/read" }, { method: "GET", url: "http://127.0.0.1/safe" }),
       "127.0.0.1",
+      { fetchImpl },
     );
-    assert.strictEqual(result.attempted, false);
-    assert.match(result.note, /private\/internal host/);
+    assert.strictEqual(result.attempted, true);
+    assert.strictEqual(result.pass, true);
+    assert.strictEqual(result.differential, "target_only");
   });
 
-  it("uses the shared classifier to reject 6to4 and Teredo literals", async () => {
+  it("replays 6to4 and Teredo literals the same as any other address", async () => {
     for (const host of ["2002:c0a8:0101::1", "2001:0000:4136:e378:8000:63bf:3fff:fdd2"]) {
+      const fetchImpl = async (input: string | URL) =>
+        new Response(String(input).includes("/proof") ? "root:x:0:0" : "not found", {
+          status: 200,
+        });
       const result = await replayIntraTarget(
         evidence(
           { url: `http://[${host}]/proof` },
           { method: "GET", url: `http://[${host}]/safe` },
         ),
         `[${host}]`,
+        { fetchImpl },
       );
-      assert.strictEqual(result.attempted, false, host);
-      assert.match(result.note, /private\/internal/);
+      assert.strictEqual(result.attempted, true, host);
+      assert.strictEqual(result.differential, "target_only", host);
     }
   });
 
-  it("skips localhost and .localhost hostnames", async () => {
+  it("replays localhost and .localhost hostnames", async () => {
     for (const host of ["localhost", "app.localhost"]) {
+      const fetchImpl = async (input: string | URL) =>
+        new Response(String(input).includes("/read") ? "root:x:0:0" : "not found", { status: 200 });
       const result = await replayIntraTarget(
         evidence({ url: `http://${host}/read` }, { method: "GET", url: `http://${host}/safe` }),
         host,
+        { fetchImpl },
       );
-      assert.strictEqual(result.attempted, false, host);
+      assert.strictEqual(result.attempted, true, host);
     }
   });
 
@@ -246,7 +251,6 @@ describe("harness-verify: intra-target differential", () => {
         : new Response("owner:attacker ssn:999-99-9999", { status: 200 });
     };
     const result = await replayIntraTarget(idorEvidence(), "target.test", {
-      allowPrivate: true,
       fetchImpl,
     });
     assert.strictEqual(result.pass, true);
@@ -268,7 +272,6 @@ describe("harness-verify: intra-target differential", () => {
         : new Response("owner:attacker ssn:999-99-9999", { status: 200 });
     };
     const result = await replayIntraTarget(idorEvidence(), "target.test", {
-      allowPrivate: true,
       fetchImpl,
     });
     assert.strictEqual(result.pass, false);
@@ -278,7 +281,6 @@ describe("harness-verify: intra-target differential", () => {
   it("rejects when the baseline ALSO leaks (differential 'both', not target-only)", async () => {
     const fetchImpl = async () => new Response("owner:x victim-ssn:111-22-3333", { status: 200 });
     const result = await replayIntraTarget(idorEvidence(), "target.test", {
-      allowPrivate: true,
       fetchImpl,
     });
     assert.strictEqual(result.pass, false);
@@ -292,7 +294,6 @@ describe("harness-verify: intra-target differential", () => {
       return new Response("owner:victim victim-ssn:111-22-3333", { status: 200 });
     };
     const result = await replayIntraTarget(idorEvidence(), "target.test", {
-      allowPrivate: true,
       fetchImpl,
     });
     assert.strictEqual(result.pass, false);
@@ -308,7 +309,7 @@ describe("harness-verify: intra-target differential", () => {
       headers: ev.verify.headers,
       body: ev.verify.body,
     };
-    const result = await replayIntraTarget(ev, "target.test", { allowPrivate: true });
+    const result = await replayIntraTarget(ev, "target.test");
     assert.strictEqual(result.attempted, false);
     assert.strictEqual(result.pass, false);
     assert.match(result.note, /identical/);
@@ -327,7 +328,7 @@ describe("harness-verify: intra-target differential", () => {
   it("binds the baseline to the case target so it cannot point at another host", async () => {
     const ev = idorEvidence();
     ev.baseline = { method: "GET", url: "http://elsewhere.test/api/orders/2002" };
-    const result = await replayIntraTarget(ev, "target.test", { allowPrivate: true });
+    const result = await replayIntraTarget(ev, "target.test");
     assert.strictEqual(result.attempted, false);
     assert.match(result.note, /baseline binding failed/i);
   });

@@ -10,8 +10,8 @@
  * semantic review.
  *
  * Policy:
- * - Private/internal hosts require explicit operator authorization; otherwise
- *   replay fails closed.
+ * - Replay proceeds for private/internal hosts too (no authorization gate);
+ *   DNS pinning, redirect host-lock, and target binding still apply.
  * - Redirects are manual and every hop is checked before it is fetched.
  * - The attack request must match while the baseline request must not.
  *
@@ -23,13 +23,8 @@ import { createHash } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Worker } from "node:worker_threads";
-import { isPublicIpAddress } from "@xaccefy/pi-shared";
 import { Agent, fetch as undiciFetch } from "undici";
 import type { PoCEvidence, VerifyExpect } from "./evidence.ts";
-
-// Public re-export makes the single-source classifier identity testable across
-// the web tool and confirmation replay paths.
-export { isPublicIpAddress } from "@xaccefy/pi-shared";
 
 export type HarnessVerifyResult = {
   /** true = the harness sent both attack and baseline requests and judged them. */
@@ -259,7 +254,6 @@ export function setHarnessFetchForTest(fetchImpl: FetchLike | undefined): void {
 
 type ReplayOptions = {
   timeoutMs?: number;
-  allowPrivate?: boolean;
   /** Test-only injection; production always uses the DNS-pinned undici path. */
   fetchImpl?: FetchLike;
 };
@@ -333,16 +327,6 @@ async function replayRequest(
   const fetchImpl = opts?.fetchImpl ?? harnessFetchForTest;
 
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
-    const localName =
-      url.hostname.toLowerCase() === "localhost" ||
-      url.hostname.toLowerCase().endsWith(".localhost");
-    if (!opts?.allowPrivate && localName) {
-      return {
-        attempted: false,
-        url: url.toString(),
-        note: `${url.hostname} is a private/internal host; operator authorization is required for harness replay`,
-      };
-    }
     let addresses: ResolvedAddress[] = [];
     if (!fetchImpl) {
       try {
@@ -367,14 +351,6 @@ async function replayRequest(
         addresses = [{ address: host, family: isIP(host) as 4 | 6 }];
       }
     }
-    if (!opts?.allowPrivate && addresses.some((address) => !isPublicIpAddress(address.address))) {
-      return {
-        attempted: false,
-        url: url.toString(),
-        note: `${url.hostname} is a private/internal host; operator authorization is required for harness replay`,
-      };
-    }
-
     let closeFetched: (() => Promise<void>) | undefined;
     try {
       const requestInit: RequestInit = {

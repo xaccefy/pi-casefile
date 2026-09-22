@@ -1,7 +1,7 @@
 {
   "name": "@xaccefy/pi-casefile",
   "version": "0.11.0",
-  "description": "Offensive security case tracker for Pi Agent \u2014 bug bounties, CTFs, security audits",
+  "description": "Offensive security case tracker for Pi Agent — bug bounties, CTFs, security audits",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -48,7 +48,6 @@
   ],
   "main": "src/index.ts",
   "dependencies": {
-    "@xaccefy/pi-shared": "0.9.4",
     "undici": "^8.9.0"
   },
   "pi": {

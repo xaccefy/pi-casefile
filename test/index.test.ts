@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setHarnessFetchForTest } from "../src/harness-verify.ts";
+import { setSandboxDisabledForTest } from "../src/poc-runner.ts";
 import { getCaseById, setCasefilePath } from "../src/ledger.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
 import { STATIC_RECON_WORKFLOW, STATIC_RECON_WORKFLOW_OMP } from "../src/workflow.ts";
@@ -154,15 +155,11 @@ beforeEach(async () => {
   writeFileSync(observationArtifactPath, "observed signal (fixture)", "utf8");
   disconfirmationScriptPath = join(tempDir, "disconf.sh");
   writeFileSync(disconfirmationScriptPath, "#!/bin/sh\nexit 1", "utf8");
-  process.env.PI_POC_ROOT = tempDir;
   process.env.CASEFILE_WORKSPACE_ROOT = tempDir;
-  // Local (host) execution is operator-gated; the test harness FORCE_LOCAL
-  // so promote tests run hermetically without Docker even when Docker is
-  // installed — production still prefers the host-network sandbox.
-  process.env.PI_POC_ALLOW_LOCAL = "1";
-  process.env.PI_POC_FORCE_LOCAL = "1";
-  process.env.PI_POC_ALLOW_NETWORK = "1";
-  process.env.PI_POC_ALLOW_PRIVATE_REPLAY = "1";
+  // Keep promote/confirm tests hermetic: the Docker sandbox is disabled via
+  // the test seam (no Docker dependency, no image pulls); production still
+  // prefers the sandbox and falls back to the host when it is unavailable.
+  setSandboxDisabledForTest(true);
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = new URL(String(input));
     return url.searchParams.get("file") === "/etc/passwd"
@@ -180,12 +177,8 @@ beforeEach(async () => {
 afterEach(async () => {
   setCasefilePath(undefined);
   setScratchpadRoot(undefined);
-  delete process.env.PI_POC_ROOT;
+  setSandboxDisabledForTest(false);
   delete process.env.CASEFILE_WORKSPACE_ROOT;
-  delete process.env.PI_POC_ALLOW_LOCAL;
-  delete process.env.PI_POC_FORCE_LOCAL;
-  delete process.env.PI_POC_ALLOW_NETWORK;
-  delete process.env.PI_POC_ALLOW_PRIVATE_REPLAY;
   delete process.env.PI_SUBAGENT_CHILD;
   setHarnessFetchForTest(undefined);
   globalThis.fetch = nativeFetch;

@@ -5,7 +5,6 @@
     "": {
       "name": "@xaccefy/pi-casefile",
       "dependencies": {
-        "@xaccefy/pi-shared": "0.9.4",
         "undici": "^8.9.0",
       },
       "devDependencies": {
@@ -154,8 +153,6 @@
     "@types/node": ["@types/node@26.3.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-L3fgrnchriRC2ExBflb8j4uZZURHZfQsmQeyVzhjcHW4kkwVyo8/0h1B2MVzMTrYUJYu6G7EWs14hW/L9putqw=="],
 
     "@types/retry": ["@types/retry@0.12.0", "", {}, "sha512-wWKOClTTiizcZhXnPY4wikVAwmdYHp8q6DmC+EJUzAMsycb7HB32Kh9RN4+0gExjmPmZSAQjgURXIGATPegAvA=="],
-
-    "@xaccefy/pi-shared": ["@xaccefy/pi-shared@0.9.4", "", {}, "sha512-3hdQBlpZSS+QsCdkImCe4FUOZX809owOEUXRB+UIPjwKe8/rHCJQ3Zlkr9wXrUF4tUX754iEDZwtw5b0qYWPCQ=="],
 
     "agent-base": ["agent-base@7.1.4", "", {}, "sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ=="],
 

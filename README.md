@@ -37,7 +37,7 @@ Designed for **human + AI workflows**: every confirmed finding carries a reprodu
 pi install npm:@xaccefy/pi-casefile
 ```
 
-Peer-depends on a Pi-compatible agent host (`@earendil-works/pi-coding-agent`, `pi-ai`, `pi-tui`, `typebox`). Runtime deps: `@xaccefy/pi-shared`, `undici`.
+Peer-depends on a Pi-compatible agent host (`@earendil-works/pi-coding-agent`, `pi-ai`, `pi-tui`, `typebox`). Runtime deps: `undici`.
 
 ## Development
 

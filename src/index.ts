@@ -61,7 +61,7 @@ import {
   updateCaseResult,
   writeCaseContext,
 } from "./ledger.ts";
-import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
+import { type PocRun, type PocRunOptions, runPoc, setProjectRoot } from "./poc-runner.ts";
 import {
   detectWorkspaceRoot,
   SCRATCHPAD_PHASES,
@@ -240,7 +240,7 @@ const PromoteSchema = Type.Object(
     local: Type.Optional(
       Type.Boolean({
         description:
-          "Run with network access instead of --network none. Requires operator authorization via PI_POC_ALLOW_NETWORK=1. True host fallback additionally requires PI_POC_ALLOW_LOCAL=1.",
+          "Run with network access: host-network Docker sandbox preferred, bare host when Docker is unavailable. Only for PoCs that genuinely need live network calls.",
       }),
     ),
   },
@@ -706,11 +706,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
   // Pin the workspace root ONCE at extension load. Every scratchpad
   // / PoC-path lookup otherwise re-walks the ambient cwd on each call — a
   // mid-session `cd` would split state across two .scratchpad roots and
-  // misroot the hunt file-existence filter. The PoC runner reads PI_POC_ROOT
-  // (set only when the operator hasn't pinned it explicitly).
+  // misroot the hunt file-existence filter.
   const workspaceRoot = detectWorkspaceRoot();
   setScratchpadRoot(workspaceRoot);
-  process.env.PI_POC_ROOT ??= workspaceRoot;
+  setProjectRoot(workspaceRoot);
 
   // ── Diagnostic Error Handler ──
   const registerCaseTool = <TParams extends TSchema, TDetails = unknown, TState = unknown>(
@@ -927,14 +926,14 @@ export default function casefileExtension(pi: ExtensionAPI) {
       name: "PromoteFinding",
       label: "Run PoC Evidence",
       description:
-        "Main-agent phase 1 of confirmation: run the same PoC twice against the case target, validate nonce-bound evidence.json with a response-body assertion, then have the harness replay the attack request and a legitimate same-host baseline request itself. The machine records a predicate differential (attack matched, baseline did not); that is not automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Networked execution and private replay are operator-gated. Records a pending bundle for main-agent semantic review via ConfirmFinding. Worker/subagent processes are rejected.",
+        "Main-agent phase 1 of confirmation: run the same PoC twice against the case target, validate nonce-bound evidence.json with a response-body assertion, then have the harness replay the attack request and a legitimate same-host baseline request itself. The machine records a predicate differential (attack matched, baseline did not); that is not automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Records a pending bundle for main-agent semantic review via ConfirmFinding. Worker/subagent processes are rejected.",
       promptSnippet: "Phase 1: run PoC evidence (target x2) and record the pending bundle",
       promptGuidelines: [
         "Use PromoteFinding only from the main/coordinator agent when an investigating case has a concrete PoC script on disk and you are ready to subject its claim to the machine gate.",
         "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The final disconfirmation comes from the main agent at confirm time.",
         "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations, baseline }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url and baseline.url must belong to the case target.",
         "baseline is a legitimate same-host request whose response must NOT satisfy the attack predicate — your own account's resource for IDOR, the request without the payload for injection. It must differ from the attack request (identity or a parameter, not just whitespace).",
-        "local:true requires PI_POC_ALLOW_NETWORK=1. Private/internal harness replay additionally requires PI_POC_ALLOW_PRIVATE_REPLAY=1. Neither silently falls back to a model verdict.",
+        "local:true runs the PoC with host networking (Docker host-network sandbox preferred, bare host fallback). Use it only when the PoC genuinely needs live network calls; the default isolated sandbox stays preferred.",
         "After the bundle is recorded, stay in the main agent: inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding yourself. Never delegate validation/confirmation and never CaseUpdate status='confirmed' directly.",
       ],
       parameters: PromoteSchema,
@@ -961,11 +960,6 @@ export default function casefileExtension(pi: ExtensionAPI) {
           return fail("poc_path is REQUIRED: absolute path to the PoC script run by the harness.");
         }
         const caseTarget = current.target ?? "";
-        if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
-          return fail(
-            "Networked PoC execution is operator-gated. Set PI_POC_ALLOW_NETWORK=1 to authorize the host-network sandbox for this session.",
-          );
-        }
 
         // Anti-cheat: hash the PoC so the recorded bundle is bound to the exact
         // bytes that ran (re-verified at confirm time).
@@ -1030,14 +1024,12 @@ export default function casefileExtension(pi: ExtensionAPI) {
           evidenceRun(run2, caseTarget),
         ];
 
-        const allowPrivateReplay = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
         // Intra-target differential: prove target-dependence with the evidence's
         // same-host baseline request. The harness sends attack + baseline to the
         // case target and requires the proof on attack only.
         const harnessVerified: HarnessVerifyResult = await replayIntraTarget(
           targetRuns[0].evidence,
           caseTarget,
-          { allowPrivate: allowPrivateReplay },
         );
         const bundle: PendingConfirmation = {
           caseId,

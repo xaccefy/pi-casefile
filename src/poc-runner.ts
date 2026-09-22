@@ -64,17 +64,17 @@ export type PocRun = {
 };
 
 /**
- * Run-mode options for `runPoc`. Host execution is NEVER selectable by the
- * agent alone: `local: true` only takes effect when the OPERATOR has set
- * `PI_POC_ALLOW_LOCAL=1` (host is a fallback when Docker is unavailable;
- * `PI_POC_FORCE_LOCAL=1` + ALLOW skips Docker on purpose). The default is a
- * Docker sandbox; `network: "host"` gives the sandbox host networking while
- * keeping the read-only FS / dropped caps / unprivileged user / resource limits.
+ * Run-mode options for `runPoc`. The default is a Docker sandbox with
+ * `network: "none"`; `local: true` means "network access needed" and prefers
+ * a host-network Docker sandbox (read-only FS / dropped caps / unprivileged
+ * user / resource limits retained), falling back to a bare host run when
+ * Docker is unavailable. Host runs always get a minimal env — never the
+ * ambient operator environment.
  */
 export type PocRunOptions = {
   /** Docker sandbox networking: "none" (default) or "host" (live/network-dependent findings). */
   network?: "none" | "host";
-  /** True to run on the host (no Docker). Requires operator opt-in PI_POC_ALLOW_LOCAL=1. */
+  /** True when the PoC needs network access: host-network sandbox preferred, bare host fallback. */
   local?: boolean;
   /**
    * Extra environment variables merged into the run. The harness sets
@@ -84,9 +84,18 @@ export type PocRunOptions = {
   env?: Record<string, string>;
 };
 
-/** Operator-only opt-in for host execution (never agent-supplied). */
-const LOCAL_EXEC_ENV = "PI_POC_ALLOW_LOCAL";
 const EVIDENCE_MAX_BYTES = 256 * 1024;
+
+/**
+ * Test seam: skip the Docker sandbox and run on the host directly. Used only
+ * by the test suite to stay hermetic (no Docker dependency, no image pulls);
+ * production callers never set it. Not an env var, not agent-reachable — the
+ * only caller of runPoc is the tool layer.
+ */
+let sandboxDisabledForTest = false;
+export function setSandboxDisabledForTest(disabled: boolean): void {
+  sandboxDisabledForTest = disabled;
+}
 
 export type PocLanguage = {
   /** Docker image used when running inside the sandbox. */
@@ -115,7 +124,7 @@ const BUILTIN_LANGUAGES: Record<string, PocLanguage> = {
   },
 };
 
-/** Extension to language key. Unknown extensions need a shebang or PI_POC_DEFAULT_LANGUAGE. */
+/** Extension to language key. Unknown extensions need a shebang or a known project type. */
 const EXTENSION_MAP: Record<string, string> = {
   ".py": "python",
   ".js": "node",
@@ -141,8 +150,17 @@ function makeNonce(): string {
 const PULL_TIMEOUT_MS = 300_000;
 const MAX_BUFFER = 8 * 1024 * 1024;
 
+/** Workspace-root pin for PoC-path containment. The extension sets this at
+ * load; tests and direct callers fall back to the .git-marker walk. */
+let pinnedProjectRoot: string | undefined;
+
+/** Set the project root used for PoC-path containment (extension load time). */
+export function setProjectRoot(root: string | undefined): void {
+  pinnedProjectRoot = root ? resolve(root) : undefined;
+}
+
 function getProjectRoot(): string {
-  return findWorkspaceRoot(["PI_POC_ROOT"], [".git"]);
+  return pinnedProjectRoot ?? findWorkspaceRoot([], [".git"]);
 }
 
 function detectProjectType(): string | undefined {
@@ -203,18 +221,13 @@ function resolveLanguage(pocPath: string): { key: string; language: PocLanguage 
     return { key: projectType, language: BUILTIN_LANGUAGES[projectType] };
   }
 
-  // 4. Unknown extension: allow env override specifying a single language key.
-  const envDefault = process.env.PI_POC_DEFAULT_LANGUAGE?.trim();
-  if (envDefault && BUILTIN_LANGUAGES[envDefault]) {
-    return { key: envDefault, language: BUILTIN_LANGUAGES[envDefault] };
-  }
-
+  // 4. Unknown extension: no further fallback — demand a shebang or a known extension.
   const supported = Object.keys(BUILTIN_LANGUAGES).sort().join(", ");
   throw new Error(
     `Cannot determine PoC language for "${pocPath}". ` +
       `Detected extension: "${ext || "none"}". ` +
       `Supported languages: ${supported}. ` +
-      `Add a shebang, use a known extension, or set PI_POC_DEFAULT_LANGUAGE.`,
+      "Add a shebang or use a known extension.",
   );
 }
 
@@ -233,18 +246,12 @@ function validatePocPath(pocPath: string): string {
   }
 
   const root = getProjectRoot();
-  // Operator escape hatch: PI_POC_ALLOW_ABSOLUTE=1 disables BOTH the lexical
-  // and the realpath containment checks (agent cannot set it).
-  const allowAbsolute = process.env.PI_POC_ALLOW_ABSOLUTE === "1";
   // Use path.relative so prefix-sibling escapes like /tmp/proj vs /tmp/proj-evil are rejected.
   // startsWith(`${root}/`) would accept /tmp/proj-evil when root is /tmp/proj.
   const rel = relative(root, normalized);
   const outsideWorkspace = rel === "" ? false : rel.startsWith("..") || isAbsolute(rel);
-  if (outsideWorkspace && !allowAbsolute) {
-    throw new Error(
-      `PoC path must be under the project workspace (${root}). ` +
-        `Set PI_POC_ALLOW_ABSOLUTE=1 to allow arbitrary absolute paths.`,
-    );
+  if (outsideWorkspace) {
+    throw new Error(`PoC path must be under the project workspace (${root}).`);
   }
 
   if (!existsSync(normalized)) {
@@ -262,15 +269,13 @@ function validatePocPath(pocPath: string): string {
   } catch {
     throw new Error(`PoC path cannot be resolved: ${pocPath}`);
   }
-  if (!allowAbsolute) {
-    const realRel = relative(root, real);
-    const realOutside = realRel === "" ? false : realRel.startsWith("..") || isAbsolute(realRel);
-    if (realOutside) {
-      throw new Error(
-        `PoC path resolves outside the project workspace (${real}). ` +
-          `Symlinked files outside ${root} are rejected.`,
-      );
-    }
+  const realRel = relative(root, real);
+  const realOutside = realRel === "" ? false : realRel.startsWith("..") || isAbsolute(realRel);
+  if (realOutside) {
+    throw new Error(
+      `PoC path resolves outside the project workspace (${real}). ` +
+        `Symlinked files outside ${root} are rejected.`,
+    );
   }
   const realStat = statSync(real);
   if (!realStat.isFile()) {
@@ -741,19 +746,17 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
  * Language detection (in order):
  * 1. Shebang line in the PoC file.
  * 2. File extension (a .py PoC in a Node repo still runs under python).
- * 3. PI_POC_DEFAULT_LANGUAGE environment variable (a built-in language key).
+ * 3. Project type detection when the extension is unknown/unmapped.
  *
  * Security:
- * - PoC paths must be absolute and under the project workspace by default.
+ * - PoC paths must be absolute and under the project workspace.
  * - Docker sandbox runs with read-only root FS, dropped caps, no new
  *   privileges, an unprivileged user, and resource limits. Networking is
- *   `none` by default; `network: "host"` adds host networking for live
- *   findings WITHOUT giving up the FS/cap/user isolation.
- * - Host execution (local: true) is NOT agent-selectable: the default is a
- *   host-network Docker sandbox. Bare host requires the operator's
- *   `PI_POC_ALLOW_LOCAL=1` and is used only when Docker is unavailable
- *   (or when `PI_POC_FORCE_LOCAL=1` is also set). Without ALLOW the run
- *   fails closed if Docker cannot start.
+ *   `none` by default; host networking is used only when the caller asks for
+ *   it (local: true) and keeps the FS/cap/user isolation.
+ * - When Docker is unavailable the run falls back to the host with a minimal
+ *   env — isolation is best-effort, evidence binding (nonce + evidence dir)
+ *   never is.
  */
 export function runPoc(pocPath: string, options?: PocRunOptions): PocRun {
   const normalized = validatePocPath(pocPath);
@@ -761,40 +764,24 @@ export function runPoc(pocPath: string, options?: PocRunOptions): PocRun {
 
   const opts: PocRunOptions = options ?? {};
 
-  // Operator/test-harness escape: PI_POC_FORCE_LOCAL=1 together with the
-  // operator opt-in PI_POC_ALLOW_LOCAL=1 runs EVERY PoC on the host, skipping
-  // Docker entirely — including default (network:"none") runs, not just
-  // local:true ones. Both flags are operator env (never agent-supplied), so this
-  // cannot be triggered by a finding. Without them, execution falls through to
-  // the isolated sandbox as before.
-  if (process.env.PI_POC_FORCE_LOCAL === "1" && process.env[LOCAL_EXEC_ENV] === "1") {
+  if (sandboxDisabledForTest) {
     return runLocal(normalized, language, opts.env);
   }
 
-  // Host execution is gated by the OPERATOR, never by an agent-supplied flag.
-  // `local: true` means "network access needed":
-  //   1. Prefer a host-network Docker sandbox (isolation retained).
-  //   2. Fall back to bare host ONLY when Docker/image is unavailable AND the
-  //      operator set PI_POC_ALLOW_LOCAL=1. (FORCE_LOCAL+ALLOW never reaches
-  //      here — the operator escape above returns before the sandbox path.)
   if (opts.local === true) {
-    const allowLocal = process.env[LOCAL_EXEC_ENV] === "1";
+    // "local" means network access is needed: prefer the host-network Docker
+    // sandbox; fall back to a bare host run when Docker/image is unavailable.
     const sandboxed = runSandboxed(normalized, language, "host", opts.env);
     if (!sandboxed.infraError) {
       return sandboxed;
     }
-    if (allowLocal) {
-      return runLocal(normalized, language, opts.env);
-    }
-    return {
-      ...sandboxed,
-      output:
-        sandboxed.output +
-        `\n[host execution blocked] local:true cannot run on the host without the operator's ` +
-        `${LOCAL_EXEC_ENV}=1 — an agent-supplied local flag alone cannot enable host execution. ` +
-        "Ask the operator to opt in, or use the default (isolated) sandbox if the PoC does not need network.",
-    };
+    return runLocal(normalized, language, opts.env);
   }
 
-  return runSandboxed(normalized, language, opts.network ?? "none", opts.env);
+  const isolated = runSandboxed(normalized, language, opts.network ?? "none", opts.env);
+  if (!isolated.infraError) {
+    return isolated;
+  }
+  // Docker unavailable: run on the host rather than fail the pipeline.
+  return runLocal(normalized, language, opts.env);
 }
