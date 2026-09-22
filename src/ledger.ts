@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { MainAgentVerdict, PanelVote, PoCEvidence } from "./evidence.ts";
+import type { MainAgentVerdict, PoCEvidence } from "./evidence.ts";
 import { scanArtifactForSecrets } from "./evidence.ts";
 import type { HarnessVerifyResult } from "./harness-verify.ts";
 import {
@@ -343,7 +343,7 @@ export type RetryPolicy = {
 
 /** One harness-observed PoC run with its validated, nonce-bound evidence. */
 export type PocEvidenceRun = {
-  mode: "poc" | "control";
+  mode: "poc";
   target: string;
   /** The run's PI_POC_NONCE — evidence.nonce must equal it (binds evidence to the run). */
   nonce: string;
@@ -362,80 +362,23 @@ export type PocEvidenceRun = {
   evidencePath?: string;
 };
 
-/** Harness-observed out-of-band interactions (Tier 1, docs/poc-trust-model.md). */
-export type OobVerification = {
-  attempted: boolean;
-  targetHits: number;
-  controlHits: number;
-  /** True only when the PoC runner cannot directly reach the listener. */
-  sourceSeparated?: boolean;
-  note: string;
-};
-
 export type PendingConfirmation = {
   caseId: string;
   ranAt: string;
   pocPath: string;
   /** SHA-256 of the PoC script AT RUN TIME — re-hashed at confirm to catch edits. */
   pocSha256: string;
-  /**
-   * Differential shape. Absent/"inter_host" (default) = same request to target
-   * vs a distinct patched control host, proven by a separate control run +
-   * `replayDifferential`. "intra_target" = attack vs a legitimate same-host
-   * `baseline` request inside each run's evidence, proven by `replayIntraTarget`
-   * — no control run or control target (access-control / business-logic classes).
-   */
-  mode?: "inter_host" | "intra_target";
-  /** inter_host only. */
-  controlPath?: string;
-  /** inter_host only. */
-  controlTarget?: string;
   targetRuns: [PocEvidenceRun, PocEvidenceRun];
-  /** inter_host only — the same PoC run against the control target. */
-  controlRun?: PocEvidenceRun;
-  /** Harness's own replay of evidence.verify (public targets). Absent = legacy bundle. */
+  /** Harness's own attack-vs-baseline replay of the evidence contract. */
   harnessVerified?: HarnessVerifyResult;
-  /** OOB-only bundles: per-run oracle tokens so phase-2 can re-poll freshly.
-   * Stored raw deliberately: the oracle is operator-owned and bearer-gated,
-   * so a ledger reader without oracle write access cannot fabricate hits. */
-  oobTokens?: { targetToken: string; controlToken: string };
-  /** Harness-owned OOB listener log for the run (opt-in blind classes). */
-  callbackVerified?: OobVerification;
-  /**
-   * Optional pre-gate panel votes (advisory). CONFIRMED additionally requires
-   * a 2/3 exploit quorum or an explicit override note on the verdict; votes
-   * never commit anything — the main agent still owns the verdict.
-   */
-  panelVotes?: PanelVote[];
-};
-
-/**
- * Fresh machine transcript produced inside the main agent's ConfirmFinding call.
- *
- * BOUNDARY NOTE: the ledger enforces the STRUCTURAL floor on this object —
- * valid timestamp newer than phase 1 and ≤5 minutes old, target/control
- * binding, conclusive `target_only` differential, canary transcript when
- * requested (see assertMainAgentVerification). What it cannot enforce at this
- * API boundary is WHO executed the replay: in production the only caller is
- * the PromoteFinding/ConfirmFinding tool layer in index.ts, which runs the
- * replay itself before calling applyConfirmationResult. A second integration
- * calling applyConfirmationResult directly owns the provenance of the
- * transcript it passes. Cross-process identity limits are documented in
- * docs/confirmation-design.md §7 (honest limits).
- */
-export type MainAgentVerification = {
-  at: string;
-  result: HarnessVerifyResult;
 };
 
 /** Persisted main-agent verdict; `confirmer` naming is retained for DB compatibility. */
 export type MainAgentVerdictRecord = MainAgentVerdict & {
   at: string;
   reviewer: "main_agent";
-  /** Harness-owned phase-2 replay bound to this verdict. */
-  phase2Verification?: MainAgentVerification;
-  /** What the machine actually established; semantic vulnerability judgment remains main-agent-owned. */
-  proofStrength?: "predicate_differential" | "canary_differential";
+  /** What the machine established (predicate differential); the semantic judgment remains main-agent-owned. */
+  proofStrength?: "predicate_differential";
 };
 
 /** @deprecated Compatibility alias for the legacy database/API field name. */
@@ -2464,11 +2407,8 @@ const MAX_TOTAL_ARTIFACT_CHARS = 400_000;
 
 /**
  * Recursively redact sensitive values in a serialized object:
- * - local filesystem paths (path/pocPath/controlPath/evidencePath) → basename
+ * - local filesystem paths (path/pocPath/evidencePath) → basename
  *   (the context bundle must never leak the researcher's local paths);
- * - OOB oracle tokens (targetToken/controlToken) → sha256 prefix — the raw
- *   tokens are bearer credentials against the oracle and stay DB-only for the
- *   phase-2 re-poll; every rendered view must show a fingerprint instead.
  */
 function redactPaths(value: unknown, seen = new Set<object>()): unknown {
   if (Array.isArray(value)) return value.map((v) => redactPaths(v, seen));
@@ -2477,13 +2417,22 @@ function redactPaths(value: unknown, seen = new Set<object>()): unknown {
   seen.add(value);
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value)) {
-    if (typeof v === "string" && (k === "targetToken" || k === "controlToken")) {
-      out[k] = `sha256:${createHash("sha256").update(v).digest("hex").slice(0, 12)}`;
-    } else if (
+    if (
       typeof v === "string" &&
       (k === "path" || k === "pocPath" || k === "controlPath" || k === "evidencePath")
     ) {
+      // Local paths → basename: rendered views must never leak the
+      // researcher's local tree. controlPath matters for legacy inter-host
+      // bundles; harmless for new ones.
       out[k] = basename(v) || v;
+    } else if (
+      (k === "targetToken" || k === "controlToken") &&
+      typeof v === "string" &&
+      v.length > 0
+    ) {
+      // Legacy OOB oracle tokens are bearer credentials — fingerprint, never
+      // render raw. Pre-0.11 ledgers can still carry them in pending bundles.
+      out[k] = `sha256:${createHash("sha256").update(v).digest("hex").slice(0, 12)} (redacted)`;
     } else {
       out[k] = redactPaths(v, seen);
     }
@@ -2696,8 +2645,12 @@ export function writeCaseContext(id: string): CaseContextResult {
       : undefined,
     current.controlVerified
       ? mdSection(
-          "Control-Target Check (anti-cheat)",
-          `### Control Run Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Control target:** ${current.controlVerified.target ?? "not recorded"}\n- **Differential (machine-checked):** control evidence differs from the target runs' evidence — the claimed impact is target-dependent (assertEvidenceDifferential, re-checked at confirm).\n- **Note:** zero exit is necessary run integrity, never vulnerability proof; output markers are diagnostic only. The machine floor is the harness differential plus main-agent review.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
+          "Same-Host Baseline Check (anti-cheat)",
+          `### Baseline Replay Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Recorded target:** ${current.controlVerified.target ?? "not recorded"}\n${
+            current.controlVerified.mode === "control"
+              ? "- **Inter-host control run (pre-0.11 pipeline):** recorded as-is; the inter-host model was retired in 0.11. See Complete Case Record for the raw fields.\n"
+              : "- **Determinism (machine-checked):** both target runs produced identical evidence (assertEvidenceDifferential, re-checked at confirm).\n- **Differential (machine-checked):** the harness replayed the evidence's attack request and its legitimate same-host baseline request — the attack predicate matched on attack only (attack/baseline replay, recorded at promote and re-validated at confirm).\n"
+          }- **Note:** zero exit is necessary run integrity, never vulnerability proof; output markers are diagnostic only. The machine floor is the harness differential plus main-agent review.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
     mdSection("Disconfirmation Attempt", current.disconfirmation),

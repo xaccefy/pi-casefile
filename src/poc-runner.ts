@@ -78,7 +78,7 @@ export type PocRunOptions = {
   local?: boolean;
   /**
    * Extra environment variables merged into the run. The harness sets
-   * `PI_POC_MODE` ("poc" | "control" | "disconfirmation") and `PI_POC_TARGET`
+   * `PI_POC_MODE` ("poc") and `PI_POC_TARGET`
    * (the case target) so PoCs can be written once and parameterized per run.
    */
   env?: Record<string, string>;
@@ -694,7 +694,7 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
       // Host runs get a MINIMAL env: OS locale/temp vars so interpreters
       // resolve and run, plus the harness env contract — never the operator's
       // ambient process env. Proxy URLs can embed credentials and PI_*
-      // carries operator secrets (e.g. PI_OOB_ORACLE_TOKEN bearer), and the
+      // carries operator secrets (e.g. oracle bearer tokens), and the
       // PoC script is untrusted agent-authored code. An operator who needs a
       // specific non-secret value for a local run injects it explicitly via
       // the run env. The sandboxed path was already minimal (explicit -e
@@ -763,7 +763,7 @@ export function runPoc(pocPath: string, options?: PocRunOptions): PocRun {
 
   // Operator/test-harness escape: PI_POC_FORCE_LOCAL=1 together with the
   // operator opt-in PI_POC_ALLOW_LOCAL=1 runs EVERY PoC on the host, skipping
-  // Docker entirely — including default (network:"none") and OOB runs, not just
+  // Docker entirely — including default (network:"none") runs, not just
   // local:true ones. Both flags are operator env (never agent-supplied), so this
   // cannot be triggered by a finding. Without them, execution falls through to
   // the isolated sandbox as before.

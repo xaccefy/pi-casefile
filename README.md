@@ -15,9 +15,8 @@ A structured ledger for offensive-security work — bug bounties, CTFs, audits �
 
 Cases move `hypothesis → investigating → confirmed → reported`. Promotion between phases is gated:
 
-- **Zero exit is necessary but never proof** — direct-response findings require nonce-bound body evidence plus a DNS-pinned, conclusive `target_only` replay against an operator-approved control
-- **Differential confirmation** — `inter_host` (attack vs control host) or `intra_target` (attack vs baseline request) so "it worked" means *the discriminator fired*, not "the agent said so"
-- **Blind/OOB classes** confirm through an operator-run oracle with per-run tokens and source-separation attestation
+- **Zero exit is necessary but never proof** — direct-response findings require nonce-bound body evidence plus a DNS-pinned, conclusive `target_only` attack-vs-baseline replay against the case target (recorded at promote; the bundle's baseline binding and differential are re-validated at confirm)
+- **Differential confirmation** — the attack request must satisfy the claimed predicate while a legitimate same-host baseline request must not, so "it worked" means *the discriminator fired*, not "the agent said so"
 - Only the main agent makes the semantic decision and commits phase transitions
 
 Designed for **human + AI workflows**: every confirmed finding carries a reproducible evidence trail a human can audit.

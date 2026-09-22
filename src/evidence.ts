@@ -2,9 +2,9 @@
  * Evidence contract for PoC confirmation.
  *
  * A PoC must write `evidence.json` into $PI_POC_EVIDENCE_DIR: a nonce-bound,
- * schema-validated record of what it claims and the request spec the harness
- * executes against both target and control. The harness validates the file,
- * binds it to the run via $PI_POC_NONCE, and acquires the responses itself.
+ * schema-validated record of what it claims, the attack request spec, and a
+ * legitimate same-host baseline request. The harness validates the file,
+ * binds it to the run via $PI_POC_NONCE, and acquires both responses itself.
  * The main/coordinator agent remains the semantic reviewer after the machine differential.
  *
  * Exit zero is required run integrity, but never vulnerability proof.
@@ -21,43 +21,26 @@ export type VerifyExpect = {
   body_regex?: string[];
 };
 
-/** Replaced only inside the harness replay, after the PoC process has exited. */
-export const POC_CANARY_PLACEHOLDER = "{{PI_POC_CANARY}}";
-
-export type VerifyCanary = {
-  /** Reflection is machine-checked: target must return the fresh token and control must not. */
-  mode: "reflection";
-  /** Fixed literal; callers cannot choose or predict the harness-generated token. */
-  placeholder: typeof POC_CANARY_PLACEHOLDER;
-};
-
 export type PoCEvidence = {
   /** Must equal the run's PI_POC_NONCE (harness-verified). */
   nonce: string;
   /** What the exploit asserts, e.g. "read /etc/passwd of target". */
   claim: string;
-  /** Request spec the harness executes in phase 1 and again from the main-agent phase-2 call. */
+  /** Attack request spec the harness executes to acquire machine evidence. */
   verify: {
     method: string;
     url: string;
     headers?: Record<string, string>;
     body?: string;
     expect: VerifyExpect;
-    /** Optional stronger causality dimension, independent of the authored predicate. */
-    canary?: VerifyCanary;
-    /**
-     * Differential shape. "inter_host" (default) = same request to target vs a
-     * distinct patched control host (body-carried proof). "intra_target" = attack
-     * request vs a legitimate same-host `baseline` request (access-control /
-     * business-logic classes, where the discriminating variable is identity or a
-     * parameter, not the host) — requires `baseline`.
-     */
-    mode?: "inter_host" | "intra_target";
   };
   /** What the script itself saw — corroboration only, never proof. */
   observations: string[];
-  /** Optional baseline request for the main agent's differential review. */
-  baseline?: {
+  /**
+   * Legitimate same-host request whose response must NOT satisfy the attack
+   * predicate — the differential control (identity or parameter varies, not host).
+   */
+  baseline: {
     method: string;
     url: string;
     headers?: Record<string, string>;
@@ -184,10 +167,6 @@ function hasDiscriminatingBodyExpectation(expect: Record<string, unknown>): bool
   );
 }
 
-function countOccurrences(value: string, needle: string): number {
-  return value.split(needle).length - 1;
-}
-
 /**
  * Parse + validate a PoC's evidence.json. Returns the validated object or a
  * field-level error. Deliberately strict: an invalid evidence file means the
@@ -230,48 +209,18 @@ export function parsePoCEvidence(
       error: `evidence.json verify.body must be a string no longer than ${MAX_REQUEST_BODY_CHARS} characters`,
     };
   }
-  if (verify.canary !== undefined) {
-    if (
-      !isRecord(verify.canary) ||
-      verify.canary.mode !== "reflection" ||
-      verify.canary.placeholder !== POC_CANARY_PLACEHOLDER
-    ) {
-      return {
-        ok: false,
-        error: `evidence.json verify.canary must be {"mode":"reflection","placeholder":"${POC_CANARY_PLACEHOLDER}"}`,
-      };
-    }
-    const canaryLocations = [
-      verify.url,
-      typeof verify.body === "string" ? verify.body : "",
-      ...(isRecord(verify.headers)
-        ? Object.values(verify.headers).filter(
-            (value): value is string => typeof value === "string",
-          )
-        : []),
-    ];
-    const count = canaryLocations.reduce(
-      (total, value) => total + countOccurrences(value, POC_CANARY_PLACEHOLDER),
-      0,
-    );
-    if (count !== 1) {
-      return {
-        ok: false,
-        error: `evidence.json verify.canary requires exactly one ${POC_CANARY_PLACEHOLDER} placeholder across url, body, or header values (got ${count})`,
-      };
-    }
-  }
-  if (verify.mode !== undefined && verify.mode !== "inter_host" && verify.mode !== "intra_target") {
-    return {
-      ok: false,
-      error: 'evidence.json verify.mode must be "inter_host" or "intra_target"',
-    };
-  }
-  if (verify.mode === "intra_target" && !isRecord(raw.baseline)) {
+  if (verify.mode !== undefined) {
     return {
       ok: false,
       error:
-        "evidence.json verify.mode intra_target requires baseline — a legitimate same-host request whose response must NOT satisfy the attack predicate",
+        "evidence.json verify.mode is removed — the attack-vs-baseline differential is the only confirmation model. Drop verify.mode and declare evidence.baseline.",
+    };
+  }
+  if (verify.canary !== undefined) {
+    return {
+      ok: false,
+      error:
+        "evidence.json verify.canary is removed — the reflection canary tier was retired. Remove verify.canary and any {{PI_POC_CANARY}} placeholder.",
     };
   }
   const expect = verify.expect;
@@ -332,41 +281,45 @@ export function parsePoCEvidence(
   ) {
     return { ok: false, error: "evidence.json observations exceed the bounded string-array limit" };
   }
-  if (raw.baseline !== undefined) {
-    const b = raw.baseline;
-    if (!isRecord(b)) return { ok: false, error: "evidence.json baseline must be an object" };
-    if (
-      !nonEmptyString(b.method) ||
-      !HTTP_METHODS.includes(b.method.toUpperCase()) ||
-      !httpUrl(b.url)
-    ) {
-      return {
-        ok: false,
-        error: "evidence.json baseline needs an http(s) url and a valid HTTP method",
-      };
-    }
-    if (b.headers !== undefined && !headerRecord(b.headers)) {
-      return {
-        ok: false,
-        error:
-          "evidence.json baseline.headers must be bounded valid end-to-end HTTP headers; authority, framing, proxy, and hop-by-hop headers are forbidden",
-      };
-    }
-    if (
-      b.body !== undefined &&
-      (typeof b.body !== "string" || b.body.length > MAX_REQUEST_BODY_CHARS)
-    ) {
-      return {
-        ok: false,
-        error: `evidence.json baseline.body must be no longer than ${MAX_REQUEST_BODY_CHARS} characters`,
-      };
-    }
-    if (
-      b.body_contains !== undefined &&
-      !boundedStringArray(b.body_contains, MAX_EXPECT_VALUES, MAX_EXPECT_CHARS)
-    ) {
-      return { ok: false, error: "evidence.json baseline.body_contains exceeds limits" };
-    }
+  const b = raw.baseline;
+  if (!isRecord(b)) {
+    return {
+      ok: false,
+      error:
+        "evidence.json requires baseline — a legitimate same-host request whose response must NOT satisfy the attack predicate",
+    };
+  }
+  if (
+    !nonEmptyString(b.method) ||
+    !HTTP_METHODS.includes(b.method.toUpperCase()) ||
+    !httpUrl(b.url)
+  ) {
+    return {
+      ok: false,
+      error: "evidence.json baseline needs an http(s) url and a valid HTTP method",
+    };
+  }
+  if (b.headers !== undefined && !headerRecord(b.headers)) {
+    return {
+      ok: false,
+      error:
+        "evidence.json baseline.headers must be bounded valid end-to-end HTTP headers; authority, framing, proxy, and hop-by-hop headers are forbidden",
+    };
+  }
+  if (
+    b.body !== undefined &&
+    (typeof b.body !== "string" || b.body.length > MAX_REQUEST_BODY_CHARS)
+  ) {
+    return {
+      ok: false,
+      error: `evidence.json baseline.body must be no longer than ${MAX_REQUEST_BODY_CHARS} characters`,
+    };
+  }
+  if (
+    b.body_contains !== undefined &&
+    !boundedStringArray(b.body_contains, MAX_EXPECT_VALUES, MAX_EXPECT_CHARS)
+  ) {
+    return { ok: false, error: "evidence.json baseline.body_contains exceeds limits" };
   }
   return { ok: true, evidence: raw as unknown as PoCEvidence };
 }
@@ -444,107 +397,20 @@ export const CONFIRM_DIFFERENTIAL_VALUES = [
 export type ConfirmDifferential = (typeof CONFIRM_DIFFERENTIAL_VALUES)[number];
 
 export const SEVERITY_MATCH_VALUES = ["under", "over", "ok"] as const;
-export const CANARY_ASSESSMENT_VALUES = ["verified", "not_applicable"] as const;
-
-// ── Quorum panel votes (advisory, CONFIRMED-blocking) ───────────────
-
-export const PANEL_VERDICT_VALUES = ["exploit", "not_exploit", "inconclusive"] as const;
-export type PanelVote = {
-  verdict: (typeof PANEL_VERDICT_VALUES)[number];
-  rationale: string;
-  model: string;
-  at?: string;
-};
-
-/** Bounded panel: enough voices for 2/3 quorum, small enough to stay cheap. */
-const MAX_PANEL_VOTES = 5;
-
-/**
- * Validate panel votes recorded on a promotion bundle. Votes are advisory —
- * they gate only the CONFIRMED commit (quorum or explicit override note) —
- * but their SHAPE is machine-checked so a malformed panel cannot silently
- * count as a quorum.
- */
-export function validatePanelVotes(
-  raw: unknown,
-): { ok: true; votes: PanelVote[] } | { ok: false; error: string } {
-  if (!Array.isArray(raw)) return { ok: false, error: "panel_votes must be an array" };
-  if (raw.length === 0) return { ok: false, error: "panel_votes must not be empty when provided" };
-  if (raw.length > MAX_PANEL_VOTES) {
-    return { ok: false, error: `panel_votes exceeds ${MAX_PANEL_VOTES} entries` };
-  }
-  for (const [index, v] of raw.entries()) {
-    if (!isRecord(v)) return { ok: false, error: `panel_votes[${index}] must be an object` };
-    if (
-      !nonEmptyString(v.verdict) ||
-      !(PANEL_VERDICT_VALUES as readonly string[]).includes(v.verdict)
-    ) {
-      return {
-        ok: false,
-        error: `panel_votes[${index}].verdict must be one of ${PANEL_VERDICT_VALUES.join(" | ")}`,
-      };
-    }
-    if (!nonEmptyString(v.rationale)) {
-      return { ok: false, error: `panel_votes[${index}].rationale must be a non-empty string` };
-    }
-    if (!nonEmptyString(v.model)) {
-      return { ok: false, error: `panel_votes[${index}].model must be a non-empty string` };
-    }
-    if (v.at !== undefined) {
-      if (!nonEmptyString(v.at) || !Number.isFinite(Date.parse(v.at))) {
-        return { ok: false, error: `panel_votes[${index}].at must be a parseable timestamp` };
-      }
-    }
-  }
-  return { ok: true, votes: raw as unknown as PanelVote[] };
-}
-
-/**
- * Quorum rule: a panel of at least 3 votes with at least 2 exploit verdicts
- * and exploit strictly ahead of not_exploit. Anything else — no panel, a tied
- * panel, or a dissenting majority — requires the main agent's explicit
- * override note to CONFIRM.
- */
-export function panelQuorumReached(votes: PanelVote[] | undefined): {
-  quorum: boolean;
-  exploit: number;
-  notExploit: number;
-  total: number;
-} {
-  const list = votes ?? [];
-  const exploit = list.filter((v) => v.verdict === "exploit").length;
-  const notExploit = list.filter((v) => v.verdict === "not_exploit").length;
-  return {
-    quorum: list.length >= 3 && exploit >= 2 && exploit > notExploit,
-    exploit,
-    notExploit,
-    total: list.length,
-  };
-}
 
 export type MainAgentVerdict = {
   verdict: ConfirmVerdict;
   reasoning: string;
   /** Files/evidence the main agent actually reviewed. */
   evidence_reviewed: string[];
-  /** What the main agent observed during its review and fresh harness replay. */
+  /** What the main agent observed during review of the runs and transcripts. */
   re_execution_note?: string;
-  /** Target vs control evidence comparison. CONFIRMED requires target_only. */
+  /** Attack vs baseline evidence comparison. CONFIRMED requires target_only. */
   differential: ConfirmDifferential;
   /** Claimed severity vs what the evidence shows. */
   severity_match?: (typeof SEVERITY_MATCH_VALUES)[number];
   /** The main agent's own failed attempt to disprove — becomes the case's disconfirmation. */
   disconfirmation_attempt?: string;
-  /** Whether the machine replay carried a harness-generated causal canary. */
-  canary_assessment?: (typeof CANARY_ASSESSMENT_VALUES)[number];
-  /** Why no meaningful canary oracle exists for this exploit class. */
-  canary_reason?: string;
-  /**
-   * Why CONFIRMED proceeds without a 2/3 exploit panel quorum (no panel
-   * provisioned, panel unavailable, or documented disagreement). Required for
-   * CONFIRMED whenever quorum was not reached.
-   */
-  panel_override_note?: string;
   /** Which model judged (recorded for the accuracy ledger). */
   model?: string;
 };
@@ -552,8 +418,8 @@ export type MainAgentVerdict = {
 /**
  * Validate the main-agent verdict. CONFIRMED additionally requires a target-only
  * differential, a concrete review note, and a disconfirmation attempt. The
- * ledger separately requires a fresh harness-owned phase-2 replay; there is no
- * caller-supplied `re_executed` checkbox.
+ * verdict is judged against the still-valid phase-1 evidence bundle; there is
+ * no caller-supplied `re_executed` checkbox.
  */
 export function validateMainAgentVerdict(
   raw: unknown,
@@ -585,21 +451,6 @@ export function validateMainAgentVerdict(
     };
   }
   if (
-    raw.canary_assessment !== undefined &&
-    !CANARY_ASSESSMENT_VALUES.includes(raw.canary_assessment as never)
-  ) {
-    return {
-      ok: false,
-      error: `verdict canary_assessment must be one of ${CANARY_ASSESSMENT_VALUES.join(" | ")}`,
-    };
-  }
-  if (raw.canary_reason !== undefined && !nonEmptyString(raw.canary_reason)) {
-    return { ok: false, error: "verdict canary_reason must be a non-empty string" };
-  }
-  if (raw.panel_override_note !== undefined && !nonEmptyString(raw.panel_override_note)) {
-    return { ok: false, error: "verdict panel_override_note must be a non-empty string" };
-  }
-  if (
     raw.severity_match !== undefined &&
     !SEVERITY_MATCH_VALUES.includes(raw.severity_match as never)
   ) {
@@ -613,14 +464,14 @@ export function validateMainAgentVerdict(
       return {
         ok: false,
         error:
-          'CONFIRMED requires differential "target_only" — the control run must not demonstrate the claimed impact',
+          'CONFIRMED requires differential "target_only" — the same-host baseline must not demonstrate the claimed impact',
       };
     }
     if (!nonEmptyString(raw.re_execution_note)) {
       return {
         ok: false,
         error:
-          "CONFIRMED requires re_execution_note — record what the main agent observed during review and the fresh harness replay",
+          "CONFIRMED requires re_execution_note — record what the main agent observed during review of the runs and transcripts",
       };
     }
     if (!nonEmptyString(raw.disconfirmation_attempt)) {
@@ -628,18 +479,6 @@ export function validateMainAgentVerdict(
         ok: false,
         error:
           "CONFIRMED requires disconfirmation_attempt — the main agent's own failed attempt to disprove",
-      };
-    }
-    if (!CANARY_ASSESSMENT_VALUES.includes(raw.canary_assessment as never)) {
-      return {
-        ok: false,
-        error: `CONFIRMED requires canary_assessment (${CANARY_ASSESSMENT_VALUES.join(" | ")})`,
-      };
-    }
-    if (raw.canary_assessment === "not_applicable" && !nonEmptyString(raw.canary_reason)) {
-      return {
-        ok: false,
-        error: "CONFIRMED with canary_assessment not_applicable requires canary_reason",
       };
     }
   }

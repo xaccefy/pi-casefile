@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-casefile",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Offensive security case tracker for Pi Agent \u2014 bug bounties, CTFs, security audits",
   "keywords": [
     "pi-package",
@@ -35,7 +35,6 @@
     "src/index.ts",
     "src/evidence.ts",
     "src/harness-verify.ts",
-    "src/oob-oracle.ts",
     "src/confirmation.ts",
     "src/ledger-internal.ts",
     "src/safe-state.ts",

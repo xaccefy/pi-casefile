@@ -30,7 +30,6 @@ import {
   linkCasesResult,
   listCaseEvents,
   listEvidenceItems,
-  type MainAgentVerification,
   type PendingConfirmation,
   POC_EVIDENCE_GC_GRACE_MS,
   type PocEvidenceRun,
@@ -205,18 +204,21 @@ function makeEvidence(
       expect: { status: [200], body_contains: contains },
     },
     observations: ["response body contains the claimed entry"],
+    baseline: {
+      method: "GET",
+      url: `${origin}/read?file=report.txt`,
+    },
   };
 }
 
 function evidenceRun(
-  mode: "poc" | "control",
   target: string,
   nonce: string,
   evidence: PoCEvidence,
   overrides: Partial<PocEvidenceRun> = {},
 ): PocEvidenceRun {
   return {
-    mode,
+    mode: "poc",
     target,
     nonce,
     ranAt: new Date().toISOString(),
@@ -224,7 +226,7 @@ function evidenceRun(
     sandbox: true,
     completed: true,
     outputComplete: true,
-    output: `${mode} output`,
+    output: "poc output",
     evidence,
     evidenceSha256: sha256hex(JSON.stringify(evidence)),
     ...overrides,
@@ -233,49 +235,32 @@ function evidenceRun(
 
 /**
  * Standard confirmation fixture: a pending bundle with two deterministic
- * target runs and a DIFFERING control run (target-only differential), plus a
- * complete CONFIRMED verdict. The control is the SAME file as the PoC by
- * default (same-file contract).
+ * target runs and a passing attack-vs-baseline harness replay, plus a
+ * complete CONFIRMED verdict.
  */
 function pendingBundle(
   id: string,
   opts: {
     pocPath?: string;
-    controlPath?: string;
     targetEvidence?: PoCEvidence;
     secondTargetEvidence?: PoCEvidence;
-    controlEvidence?: PoCEvidence;
-    controlTarget?: string;
     bundleRanAt?: string;
     pocSha256?: string;
   } = {},
-): PendingConfirmation & { controlRun: PocEvidenceRun } {
+): PendingConfirmation {
   const target = getCaseById(id)?.target ?? "target";
   const pocPath = opts.pocPath ?? pocScriptPath("poc.sh");
-  const controlPath = opts.controlPath ?? pocPath; // same file by default
-  const controlTarget = opts.controlTarget ?? "control.test";
   const n1 = "nonce-target-1";
   const n2 = "nonce-target-2";
-  const nc = "nonce-control";
   const tEv =
     opts.targetEvidence ?? makeEvidence(n1, ["root:"], "read /etc/passwd of target", target);
-  const cEv =
-    opts.controlEvidence ??
-    makeEvidence(nc, ["no-such-entry"], "control lacks the vuln", controlTarget);
   const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
-    evidenceRun("poc", target, n1, tEv),
-    evidenceRun(
-      "poc",
-      target,
-      n2,
-      opts.secondTargetEvidence ??
-        makeEvidence(n2, ["root:"], "read /etc/passwd of target", target),
-    ),
+    evidenceRun(target, n1, tEv),
+    evidenceRun(target, n2, opts.secondTargetEvidence ?? { ...tEv, nonce: n2 }),
   ];
-  const controlRun = evidenceRun("control", controlTarget, nc, cEv);
   const durableDir = join(tempDir, ".pi", "poc-evidence");
   mkdirSync(durableDir, { recursive: true });
-  for (const run of [...targetRuns, controlRun]) {
+  for (const run of targetRuns) {
     const evidencePath = join(durableDir, `${run.nonce}.evidence.json`);
     writeFileSync(evidencePath, JSON.stringify(run.evidence), "utf8");
     run.evidencePath = evidencePath;
@@ -285,10 +270,7 @@ function pendingBundle(
     ranAt: opts.bundleRanAt ?? new Date().toISOString(),
     pocPath,
     pocSha256: opts.pocSha256 ?? sha256hex(readFileSync(pocPath, "utf8")),
-    controlPath,
-    controlTarget,
     targetRuns,
-    controlRun,
     harnessVerified: {
       attempted: true,
       pass: true,
@@ -305,10 +287,10 @@ function pendingBundle(
         attempted: true,
         matched: false,
         status: 404,
-        url: cEv.verify.url,
-        note: "fixture control did not match",
+        url: tEv.baseline.url,
+        note: "fixture baseline did not match",
       },
-      note: "fixture harness differential target_only",
+      note: "fixture harness intra-target differential target_only",
     },
   };
 }
@@ -316,28 +298,16 @@ function pendingBundle(
 function makeVerdict(overrides: Partial<ConfirmerVerdict> = {}): ConfirmerVerdict {
   return {
     verdict: "CONFIRMED",
-    reasoning: "re-sent the verify request: target returned the claimed entry, control did not",
-    evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (control run)"],
-    re_execution_note: "GET /read?file=/etc/passwd → 200 with root: on target; 403 on control",
+    reasoning: "reviewed the runs: attack returned the claimed entry, baseline did not",
+    evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (target run 2)"],
+    re_execution_note:
+      "GET /read?file=/etc/passwd → 200 with root:; GET /read?file=report.txt → no root:",
     differential: "target_only",
     severity_match: "ok",
     disconfirmation_attempt:
-      "tried /read?file=/etc/shadow and a patched replica → no entry; the effect is target-dependent",
-    canary_assessment: "not_applicable",
-    canary_reason: "file-read output is fixed target state and has no attacker-reflected field",
-    panel_override_note: "test fixture: panel not provisioned",
+      "tried /read?file=/etc/shadow → no entry; the effect is specific to the attack parameter",
     model: "test-model",
     ...overrides,
-  };
-}
-
-function freshMainAgentVerification(id: string): MainAgentVerification {
-  const bundle = getCaseById(id)?.pendingConfirmation;
-  assert.ok(bundle, "pending confirmation fixture exists");
-  assert.ok(bundle.harnessVerified, "phase-1 harness fixture exists");
-  return {
-    at: new Date().toISOString(),
-    result: bundle.harnessVerified,
   };
 }
 
@@ -347,7 +317,7 @@ function promote(
   opts: { verdict?: ConfirmerVerdict; bundle?: PendingConfirmation } = {},
 ): ReturnType<typeof applyConfirmationResult> {
   storePendingConfirmation(id, opts.bundle ?? pendingBundle(id));
-  return applyConfirmationResult(id, opts.verdict ?? makeVerdict(), freshMainAgentVerification(id));
+  return applyConfirmationResult(id, opts.verdict ?? makeVerdict());
 }
 
 let tempDir: string;
@@ -401,7 +371,7 @@ describe("casefile sqlite ledger", () => {
     const raw = new DatabaseSync(ledgerPath);
     raw
       .prepare("UPDATE cases SET pending_confirmation_json = ? WHERE id = ?")
-      .run(JSON.stringify({ targetRuns: [{ evidencePath: pending }], controlRun: {} }), record.id);
+      .run(JSON.stringify({ targetRuns: [{ evidencePath: pending }] }), record.id);
     raw.close();
 
     const old = new Date(Date.now() - POC_EVIDENCE_GC_GRACE_MS - 60_000);
@@ -1076,7 +1046,7 @@ describe("casefile sqlite ledger", () => {
     );
 
     // CONFIRMED requires a disconfirmation attempt, a target-only differential,
-    // a concrete review note, and a fresh harness replay. A verdict missing
+    // a concrete review note, and a complete differential. A verdict missing
     // any of these is rejected. A
     // NOT_CONFIRMED attempt above already recorded a verdict; re-store a fresh
     // bundle so the CONFIRMED path has one to commit against.
@@ -1097,23 +1067,8 @@ describe("casefile sqlite ledger", () => {
       () => applyConfirmationResult(rec.id, makeVerdict({ re_execution_note: undefined })),
       /re_execution_note/,
     );
-    assert.throws(
-      () => applyConfirmationResult(rec.id, makeVerdict()),
-      /MAIN-AGENT REPLAY REQUIRED/,
-    );
-    const misboundReplay = freshMainAgentVerification(rec.id);
-    if (misboundReplay.result.target) {
-      misboundReplay.result = {
-        ...misboundReplay.result,
-        target: { ...misboundReplay.result.target, url: "https://unrelated.test/proof" },
-      };
-    }
-    assert.throws(
-      () => applyConfirmationResult(rec.id, makeVerdict(), misboundReplay),
-      /target transcript is not bound/,
-    );
     // A complete CONFIRMED verdict promotes.
-    const ok = applyConfirmationResult(rec.id, makeVerdict(), freshMainAgentVerification(rec.id));
+    const ok = applyConfirmationResult(rec.id, makeVerdict());
     assert.strictEqual(ok.record.status, "confirmed");
   });
 
@@ -1173,7 +1128,7 @@ describe("casefile sqlite ledger", () => {
     );
   });
 
-  it("store rejects a bundle whose control run targeted the wrong host", () => {
+  it("store rejects a bundle whose runs disagree about the case target", () => {
     const rec = addCase({
       title: "Control binding",
       status: "investigating",
@@ -1182,15 +1137,8 @@ describe("casefile sqlite ledger", () => {
       target: "host-a",
     });
     const bundle = pendingBundle(rec.id);
-    bundle.controlRun.target = "somewhere-else"; // ≠ controlTarget
-    assert.throws(() => storePendingConfirmation(rec.id, bundle), /CONTROL BINDING FAILED/);
-    // Control run against the SAME host as the target runs is equally dead.
-    const same = pendingBundle(rec.id);
-    same.controlRun.target = same.targetRuns[0].target;
-    assert.throws(() => storePendingConfirmation(rec.id, same), /CONTROL BINDING FAILED/);
-    // control_target equal to the case target proves nothing.
-    const equalsCase = pendingBundle(rec.id, { controlTarget: "host-a" });
-    assert.throws(() => storePendingConfirmation(rec.id, equalsCase), /CONTROL BINDING FAILED/);
+    bundle.targetRuns[1].target = "somewhere-else"; // ≠ case target
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /same case target/);
   });
 
   it("store rejects a bundle whose harness verify replay failed", () => {
@@ -1233,70 +1181,6 @@ describe("casefile sqlite ledger", () => {
     assert.throws(() => storePendingConfirmation(rec.id, bundle), /HARNESS DIFFERENTIAL FAILED/);
   });
 
-  it("store rejects an OOB-verified bundle with zero target-token hits", () => {
-    const rec = addCase({
-      title: "OOB silent target",
-      status: "investigating",
-      evidence: "observed SSRF",
-      confidence: "high",
-      impact: "internal fetch",
-      severity: "high",
-      poc: "/tmp/poc.sh",
-      target: "host-a",
-    });
-    const bundle = pendingBundle(rec.id);
-    bundle.callbackVerified = {
-      attempted: true,
-      targetHits: 0,
-      controlHits: 0,
-      note: "listener logged 0 interactions",
-    };
-    assert.throws(() => storePendingConfirmation(rec.id, bundle), /OOB VERIFY FAILED/);
-  });
-
-  it("store rejects an OOB-verified bundle whose control token was hit", () => {
-    const rec = addCase({
-      title: "OOB self-caller",
-      status: "investigating",
-      evidence: "observed SSRF",
-      confidence: "high",
-      impact: "internal fetch",
-      severity: "high",
-      poc: "/tmp/poc.sh",
-      target: "host-a",
-    });
-    const bundle = pendingBundle(rec.id);
-    bundle.callbackVerified = {
-      attempted: true,
-      targetHits: 1,
-      controlHits: 1,
-      note: "listener logged 2 interactions",
-    };
-    assert.throws(() => storePendingConfirmation(rec.id, bundle), /OOB VERIFY FAILED/);
-  });
-
-  it("store rejects loopback OOB telemetry without source separation", () => {
-    const rec = addCase({
-      title: "OOB self-call boundary",
-      status: "investigating",
-      evidence: "observed SSRF",
-      confidence: "high",
-      impact: "internal fetch",
-      severity: "high",
-      poc: "/tmp/poc.sh",
-      target: "host-a",
-    });
-    const bundle = pendingBundle(rec.id);
-    bundle.callbackVerified = {
-      attempted: true,
-      targetHits: 1,
-      controlHits: 0,
-      sourceSeparated: false,
-      note: "loopback listener logged one target-token interaction",
-    };
-    assert.throws(() => storePendingConfirmation(rec.id, bundle), /source separation/i);
-  });
-
   it("reproduction evidence item is backed by the preserved evidence file", () => {
     const rec = addCase({
       title: "Preserved evidence",
@@ -1312,11 +1196,7 @@ describe("casefile sqlite ledger", () => {
     // The runner preserves each evidence.json into .pi/poc-evidence/; the
     // reproduction item must reference that surviving copy, not a temp file.
     storePendingConfirmation(rec.id, bundle);
-    const confirmed = applyConfirmationResult(
-      rec.id,
-      makeVerdict(),
-      freshMainAgentVerification(rec.id),
-    );
+    const confirmed = applyConfirmationResult(rec.id, makeVerdict());
     assert.strictEqual(confirmed.record.status, "confirmed");
     const repro = listEvidenceItems(rec.id).find((e) => e.role === "reproduction");
     assert.ok(repro, "reproduction item recorded");
@@ -1384,7 +1264,7 @@ describe("casefile sqlite ledger", () => {
     delete process.env.PI_SUBAGENT_CHILD;
     try {
       assert.throws(
-        () => applyConfirmationResult(rec.id, makeVerdict(), undefined, startupAuthority),
+        () => applyConfirmationResult(rec.id, makeVerdict(), startupAuthority),
         /reserved for the main\/coordinator agent/,
       );
     } finally {
@@ -1421,7 +1301,7 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(refused.record.pocVerified, undefined);
     // A second, successful attempt after a fresh phase 1.
     storePendingConfirmation(rec.id, pendingBundle(rec.id));
-    const ok = applyConfirmationResult(rec.id, makeVerdict(), freshMainAgentVerification(rec.id));
+    const ok = applyConfirmationResult(rec.id, makeVerdict());
     assert.strictEqual(ok.record.status, "confirmed");
   });
 
@@ -1438,73 +1318,21 @@ describe("casefile sqlite ledger", () => {
     });
     const bundle = pendingBundle(rec.id);
     storePendingConfirmation(rec.id, bundle);
-    const ok = applyConfirmationResult(rec.id, makeVerdict(), freshMainAgentVerification(rec.id));
+    const ok = applyConfirmationResult(rec.id, makeVerdict());
     assert.strictEqual(ok.record.status, "confirmed");
     const confirmed = getCaseById(rec.id)!;
     assert.strictEqual(confirmed.pendingConfirmation, undefined, "pending bundle cleared");
     assert.strictEqual(confirmed.disconfirmation, makeVerdict().disconfirmation_attempt);
     assert.strictEqual(confirmed.pocVerified?.mode, "poc");
     assert.strictEqual(confirmed.pocVerified?.target, "example-app");
-    assert.strictEqual(confirmed.controlVerified?.mode, "control");
+    assert.strictEqual(confirmed.controlVerified?.mode, "baseline");
     assert.strictEqual(confirmed.confirmerVerdict?.verdict, "CONFIRMED");
     assert.strictEqual(confirmed.confirmerVerdict?.model, "test-model");
     assert.strictEqual(confirmed.confirmerVerdict?.reviewer, "main_agent");
-    assert.strictEqual(
-      confirmed.confirmerVerdict?.phase2Verification?.result.differential,
-      "target_only",
-    );
     const repro = listEvidenceItems(rec.id).find((e) => e.role === "reproduction");
     assert.ok(repro, "reproduction item recorded");
     assert.strictEqual(repro!.sha256, bundle.targetRuns[0].evidenceSha256);
     assert.match(repro!.artifactPath ?? "", /\.evidence\.json$/);
-  });
-
-  it("records canary-differential strength only for a machine-observed target-only canary", () => {
-    const rec = addCase({
-      title: "Reflected canary proof",
-      status: "investigating",
-      evidence: "target reflected attacker-controlled marker",
-      confidence: "high",
-      severity: "medium",
-      poc: "send marker and compare target/control",
-      impact: "attacker-controlled reflection",
-      target: "target.test",
-    });
-    const bundle = pendingBundle(rec.id);
-    for (const run of [...bundle.targetRuns, bundle.controlRun]) {
-      run.evidence.verify.url += "&marker={{PI_POC_CANARY}}";
-      run.evidence.verify.canary = {
-        mode: "reflection",
-        placeholder: "{{PI_POC_CANARY}}",
-      };
-      run.evidenceSha256 = sha256hex(JSON.stringify(run.evidence));
-      assert.ok(run.evidencePath);
-      writeFileSync(run.evidencePath, JSON.stringify(run.evidence), "utf8");
-    }
-    bundle.harnessVerified = {
-      ...(bundle.harnessVerified as HarnessVerifyResult),
-      canary: {
-        mode: "reflection",
-        attempted: true,
-        pass: true,
-        tokenSha256: "a".repeat(64),
-        targetObserved: true,
-        controlObserved: false,
-        note: "fixture target-only canary",
-      },
-      proofStrength: "canary_differential",
-    };
-    storePendingConfirmation(rec.id, bundle);
-    const confirmed = applyConfirmationResult(
-      rec.id,
-      makeVerdict({
-        canary_assessment: "verified",
-        canary_reason: undefined,
-      }),
-      freshMainAgentVerification(rec.id),
-    ).record;
-    assert.strictEqual(confirmed.confirmerVerdict?.proofStrength, "canary_differential");
-    assert.strictEqual(confirmed.confirmerVerdict?.phase2Verification?.result.canary?.pass, true);
   });
 
   it("links coverage cells to artifact-backed evidence items and rejects bogus links", () => {
@@ -1733,7 +1561,7 @@ describe("casefile sqlite ledger", () => {
     }
   });
 
-  it("control evidence must exist and differ from the target (differential gate)", () => {
+  it("evidence differential gate: crashed runs, missing baselines, and identical pairs fail", () => {
     const rec = addCase({
       title: "Live IDOR",
       status: "investigating",
@@ -1744,30 +1572,33 @@ describe("casefile sqlite ledger", () => {
       poc: "/tmp/poc.sh",
       target: "example-app",
     });
-    // No control evidence at all -> the bundle is rejected at store time.
-    const noControl = pendingBundle(rec.id);
-    noControl.controlRun = {
-      ...noControl.controlRun,
-      evidence: undefined as unknown as PoCEvidence,
-      evidenceSha256: "",
-    };
-    assert.throws(() => storePendingConfirmation(rec.id, noControl), /no evidence/);
-    // A crashed control run (completed:false) is not evidence.
+    // A crashed target run (completed:false) is not evidence.
     const crashed = pendingBundle(rec.id);
-    crashed.controlRun = { ...crashed.controlRun, completed: false };
+    crashed.targetRuns[1] = { ...crashed.targetRuns[1], completed: false };
     assert.throws(() => storePendingConfirmation(rec.id, crashed), /did not complete/);
-    // Control evidence IDENTICAL to the target (normalized, nonce stripped)
-    // means the claimed impact is not target-dependent — the unconditional-
-    // success cheat, now judged on structured evidence instead of markers.
-    const same = pendingBundle(rec.id, {
-      controlEvidence: makeEvidence(
-        "nonce-control",
-        ["root:"],
-        "read /etc/passwd of target",
-        "example-app",
-      ),
-    });
-    assert.throws(() => storePendingConfirmation(rec.id, same), /not target-dependent/);
+    // Evidence without the baseline request is rejected by the contract.
+    const noBaseline = pendingBundle(rec.id);
+    const stripped = { ...noBaseline.targetRuns[1].evidence } as Record<string, unknown>;
+    delete stripped.baseline;
+    noBaseline.targetRuns[1].evidence = stripped as unknown as PoCEvidence;
+    noBaseline.targetRuns[1].evidenceSha256 = sha256hex(JSON.stringify(stripped));
+    assert.ok(noBaseline.targetRuns[1].evidencePath);
+    writeFileSync(noBaseline.targetRuns[1].evidencePath, JSON.stringify(stripped), "utf8");
+    assert.throws(() => storePendingConfirmation(rec.id, noBaseline), /requires baseline/);
+    // An attack/baseline pair that differs in nothing proves no differential.
+    const identical = pendingBundle(rec.id);
+    for (const run of identical.targetRuns) {
+      run.evidence.baseline = {
+        method: run.evidence.verify.method,
+        url: run.evidence.verify.url,
+        headers: run.evidence.verify.headers,
+        body: run.evidence.verify.body,
+      };
+      run.evidenceSha256 = sha256hex(JSON.stringify(run.evidence));
+      assert.ok(run.evidencePath);
+      writeFileSync(run.evidencePath, JSON.stringify(run.evidence), "utf8");
+    }
+    assert.throws(() => storePendingConfirmation(rec.id, identical), /identical/);
     // A clean differential (control lacks the claimed entry) promotes.
     const ok = promote(rec.id);
     assert.strictEqual(ok.record.status, "confirmed");
@@ -2268,7 +2099,7 @@ describe("casefile sqlite ledger", () => {
     );
   });
 
-  it("enforces the same-file control contract and script immutability at the ledger", () => {
+  it("enforces PoC script hash binding and immutability at the ledger", () => {
     const rec = addCase({
       title: "Same-file control",
       status: "investigating",
@@ -2280,18 +2111,7 @@ describe("casefile sqlite ledger", () => {
       target: "example-app",
     });
     const pocPath = join(tempDir, "poc.sh");
-    const otherPath = join(tempDir, "other.sh");
     writeFileSync(pocPath, "#!/bin/sh\necho target", "utf8");
-    writeFileSync(otherPath, "#!/bin/sh\necho control", "utf8");
-    // A DIFFERENT real file as the control — the two-file cheat.
-    assert.throws(
-      () =>
-        storePendingConfirmation(
-          rec.id,
-          pendingBundle(rec.id, { pocPath, controlPath: otherPath }),
-        ),
-      /SAME script/,
-    );
     // pocSha256 mismatch (bundle claims different bytes than the file) fails.
     assert.throws(
       () => storePendingConfirmation(rec.id, pendingBundle(rec.id, { pocSha256: "deadbeef" })),
@@ -2343,7 +2163,12 @@ describe("casefile sqlite ledger", () => {
     });
     // The two target runs claim DIFFERENT impacts — flaky/one-shot evidence.
     const flaky = pendingBundle(rec.id, {
-      secondTargetEvidence: makeEvidence("nonce-target-2", ["different-data"], "a different claim"),
+      secondTargetEvidence: makeEvidence(
+        "nonce-target-2",
+        ["different-data"],
+        "a different claim",
+        "example-app",
+      ),
     });
     assert.throws(
       () => storePendingConfirmation(rec.id, flaky),
@@ -2376,7 +2201,6 @@ describe("casefile sqlite ledger", () => {
     const bundle = pendingBundle(rec.id);
     bundle.targetRuns[0].ranAt = "2020-01-01T00:00:00Z";
     bundle.targetRuns[1].ranAt = "2020-01-01T00:00:00Z";
-    bundle.controlRun.ranAt = "2020-01-01T00:00:00Z";
     storePendingConfirmation(rec.id, bundle);
     assert.throws(() => applyConfirmationResult(rec.id, makeVerdict()), /after the PoC ran/);
   });
@@ -2557,7 +2381,7 @@ describe("artifact secret gate (defense in depth)", () => {
     assert.strictEqual(item.secretFindings, undefined);
   });
 
-  it("flags a private key block and a bearer token, and redacts OOB tokens in rendered output", () => {
+  it("flags a private key block and a bearer token", () => {
     const rec = addCase({
       title: "Key material case",
       status: "investigating",
@@ -2582,29 +2406,6 @@ describe("artifact secret gate (defense in depth)", () => {
     });
     assert.ok(item.secretFindings?.includes("private-key-block"));
     assert.ok(item.secretFindings?.includes("bearer-token"));
-
-    // OOB tokens in a pending bundle render as sha256 fingerprints, never raw.
-    const bundle = pendingBundle(rec.id);
-    bundle.oobTokens = {
-      targetToken: "raw-target-token-secret",
-      controlToken: "raw-control-token-secret",
-    };
-    bundle.callbackVerified = {
-      attempted: true,
-      targetHits: 1,
-      controlHits: 0,
-      sourceSeparated: true,
-      note: "fixture",
-    };
-    // The OOB-only shape must survive the store gate: drop the control run.
-    const oobBundle = { ...bundle } as PendingConfirmation;
-    delete (oobBundle as { controlRun?: PocEvidenceRun }).controlRun;
-    delete (oobBundle as { controlPath?: string }).controlPath;
-    delete (oobBundle as { controlTarget?: string }).controlTarget;
-    storePendingConfirmation(rec.id, oobBundle);
-    const rendered = formatCaseDetail(getCaseById(rec.id)!);
-    assert.ok(!rendered.includes("raw-target-token-secret"));
-    assert.ok(rendered.includes("sha256:"));
   });
 });
 
@@ -2668,93 +2469,6 @@ describe("report contract gate (confirmed → reported)", () => {
   });
 });
 
-describe("quorum panel pre-gate", () => {
-  const votes = (shape: ("exploit" | "not_exploit" | "inconclusive")[]) =>
-    shape.map((verdict, i) => ({
-      verdict,
-      rationale: `vote ${i}: ${verdict}`,
-      model: `panel-model-${i}`,
-      at: new Date().toISOString(),
-    }));
-
-  it("CONFIRMS without an override note when the panel reaches 2/3 exploit quorum", () => {
-    const rec = addCase({
-      title: "Quorum pass case",
-      status: "investigating",
-      evidence: "observed",
-      confidence: "high",
-      impact: "leak",
-      severity: "high",
-      poc: pocScriptPath("quorum-pass.sh"),
-      target: "quorum-pass.test",
-      disconfirmation: "Tried; held.",
-    });
-    const bundle = pendingBundle(rec.id);
-    bundle.panelVotes = votes(["exploit", "exploit", "not_exploit"]);
-    storePendingConfirmation(rec.id, bundle);
-    const { panel_override_note: _skip, ...cleanVerdict } = makeVerdict();
-    const result = applyConfirmationResult(
-      rec.id,
-      cleanVerdict,
-      freshMainAgentVerification(rec.id),
-    );
-    assert.strictEqual(result.record.status, "confirmed");
-    const confirmedEvent = listCaseEvents(rec.id).find((e) => e.eventType === "case_confirmed");
-    assert.strictEqual((confirmedEvent?.payload?.panel as { quorum?: boolean })?.quorum, true);
-  });
-
-  it("refuses CONFIRMED without quorum or an override note, and accepts it with the note", () => {
-    const rec = addCase({
-      title: "Quorum fail case",
-      status: "investigating",
-      evidence: "observed",
-      confidence: "high",
-      impact: "leak",
-      severity: "high",
-      poc: pocScriptPath("quorum-fail.sh"),
-      target: "quorum-fail.test",
-      disconfirmation: "Tried; held.",
-    });
-    // Dissenting majority: 1 exploit vs 2 not_exploit — no quorum.
-    const bundle = pendingBundle(rec.id);
-    bundle.panelVotes = votes(["exploit", "not_exploit", "not_exploit"]);
-    storePendingConfirmation(rec.id, bundle);
-    assert.throws(
-      () =>
-        applyConfirmationResult(
-          rec.id,
-          makeVerdict({ panel_override_note: undefined }),
-          freshMainAgentVerification(rec.id),
-        ),
-      /PANEL QUORUM REQUIRED/,
-    );
-    // The main agent can still commit with an explicit override note — votes
-    // are advisory-blocking, not verdict-vetoing.
-    const withNote = makeVerdict({
-      panel_override_note: "panel unavailable mid-engagement; solo confirmation documented",
-    });
-    const result = applyConfirmationResult(rec.id, withNote, freshMainAgentVerification(rec.id));
-    assert.strictEqual(result.record.status, "confirmed");
-  });
-
-  it("rejects a malformed panel at store time so it can never count as quorum", () => {
-    const rec = addCase({
-      title: "Malformed panel case",
-      status: "investigating",
-      evidence: "observed",
-      confidence: "high",
-      impact: "leak",
-      severity: "high",
-      poc: pocScriptPath("bad-panel.sh"),
-      target: "bad-panel.test",
-      disconfirmation: "Tried; held.",
-    });
-    const bundle = pendingBundle(rec.id);
-    (bundle as { panelVotes?: unknown }).panelVotes = [{ verdict: "exploit" }];
-    assert.throws(() => storePendingConfirmation(rec.id, bundle), /panel invalid/);
-  });
-});
-
 describe("retry policy metadata", () => {
   it("persists, validates, and surfaces retry_policy on the record", () => {
     const rec = addCase({ title: "Retry policy case", target: "retry.test" });
@@ -2782,7 +2496,7 @@ describe("retry policy metadata", () => {
   });
 });
 
-describe("intra-target confirmation (same-host attack-vs-baseline differential)", () => {
+describe("confirmation (same-host attack-vs-baseline differential)", () => {
   /** IDOR-style evidence: attack reads a victim object, baseline reads own. */
   function makeIntraEvidence(
     nonce: string,
@@ -2795,7 +2509,6 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
       url: `${origin}/api/orders/1001`,
       headers: { authorization: "Bearer attacker" },
       expect: { status: [200], body_contains: ["victim-ssn:111-22-3333"] },
-      mode: "intra_target",
     };
     const baseline =
       opts.baseline === "none"
@@ -2803,13 +2516,14 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
         : opts.baseline === "identical"
           ? { method: "GET", url: verify.url, headers: verify.headers }
           : { method: "GET", url: `${origin}/api/orders/2002`, headers: verify.headers };
-    return {
+    const evidence = {
       nonce,
       claim: "IDOR: cross-tenant order read",
       verify,
       observations: ["victim ssn present on attack response"],
-      ...(baseline ? { baseline } : {}),
+      baseline,
     };
+    return evidence as PoCEvidence;
   }
 
   function intraBundle(
@@ -2820,8 +2534,8 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
     const e1 = makeIntraEvidence("intra-nonce-1", target, opts);
     const e2 = makeIntraEvidence("intra-nonce-2", target, opts);
     const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
-      evidenceRun("poc", target, "intra-nonce-1", e1),
-      evidenceRun("poc", target, "intra-nonce-2", e2),
+      evidenceRun(target, "intra-nonce-1", e1),
+      evidenceRun(target, "intra-nonce-2", e2),
     ];
     const durableDir = join(tempDir, ".pi", "poc-evidence");
     mkdirSync(durableDir, { recursive: true });
@@ -2836,7 +2550,6 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
       ranAt: new Date().toISOString(),
       pocPath,
       pocSha256: sha256hex(readFileSync(pocPath, "utf8")),
-      mode: "intra_target",
       targetRuns,
       harnessVerified: opts.harnessVerified ?? {
         attempted: true,
@@ -2875,16 +2588,11 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
     });
   }
 
-  it("stores and confirms an intra-target bundle with a same-host baseline", () => {
+  it("stores and confirms a bundle with a same-host baseline", () => {
     const rec = intraCase();
     const stored = storePendingConfirmation(rec.id, intraBundle(rec.id));
     assert.ok(stored.pendingConfirmation, "bundle recorded");
-    assert.strictEqual(stored.pendingConfirmation?.mode, "intra_target");
-    const result = applyConfirmationResult(
-      rec.id,
-      makeVerdict(),
-      freshMainAgentVerification(rec.id),
-    );
+    const result = applyConfirmationResult(rec.id, makeVerdict());
     assert.strictEqual(result.record.status, "confirmed");
     assert.ok(
       result.record.evidenceItems.some((e) => e.role === "reproduction"),
@@ -2892,20 +2600,7 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
     );
   });
 
-  it("rejects an intra-target bundle that smuggles in a control run", () => {
-    const rec = intraCase();
-    const bundle = intraBundle(rec.id);
-    bundle.controlRun = evidenceRun(
-      "control",
-      "control.test",
-      "c-nonce",
-      makeIntraEvidence("c-nonce"),
-    );
-    bundle.controlTarget = "control.test";
-    assert.throws(() => storePendingConfirmation(rec.id, bundle), /must not carry a control run/i);
-  });
-
-  it("rejects intra-target evidence without a baseline request", () => {
+  it("rejects evidence without a baseline request", () => {
     const rec = intraCase();
     assert.throws(
       () => storePendingConfirmation(rec.id, intraBundle(rec.id, { baseline: "none" })),
@@ -2913,7 +2608,7 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
     );
   });
 
-  it("rejects intra-target evidence whose attack and baseline are identical", () => {
+  it("rejects evidence whose attack and baseline are identical", () => {
     const rec = intraCase();
     assert.throws(
       () => storePendingConfirmation(rec.id, intraBundle(rec.id, { baseline: "identical" })),
@@ -2921,7 +2616,7 @@ describe("intra-target confirmation (same-host attack-vs-baseline differential)"
     );
   });
 
-  it("rejects an intra-target bundle whose harness differential is not target_only", () => {
+  it("rejects a bundle whose harness differential is not target_only", () => {
     const rec = intraCase();
     const bundle = intraBundle(rec.id, {
       harnessVerified: {

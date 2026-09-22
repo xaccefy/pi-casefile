@@ -12,20 +12,12 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { type TSchema, Type } from "typebox";
 import {
-  CANARY_ASSESSMENT_VALUES,
   CONFIRM_DIFFERENTIAL_VALUES,
   CONFIRM_VERDICT_VALUES,
-  PANEL_VERDICT_VALUES,
   SEVERITY_MATCH_VALUES,
   validateMainAgentVerdict,
-  validatePanelVotes,
 } from "./evidence.ts";
-import {
-  controlTargetAuthorizationError,
-  type HarnessVerifyResult,
-  replayDifferential,
-  replayIntraTarget,
-} from "./harness-verify.ts";
+import { type HarnessVerifyResult, replayIntraTarget } from "./harness-verify.ts";
 import {
   addCaseResult,
   addEvidenceItemResult,
@@ -54,8 +46,6 @@ import {
   getCasefilePath,
   LINK_KIND_VALUES,
   linkCasesResult,
-  type MainAgentVerification,
-  type OobVerification,
   type PendingConfirmation,
   type PocEvidenceRun,
   PRIORITY_VALUES,
@@ -71,13 +61,6 @@ import {
   updateCaseResult,
   writeCaseContext,
 } from "./ledger.ts";
-import {
-  type OobOracleConfig,
-  type ProvisionedCallback,
-  provisionCallback,
-  readOobOracleConfig,
-  verifyOobDifferential,
-} from "./oob-oracle.ts";
 import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
   detectWorkspaceRoot,
@@ -240,12 +223,13 @@ const CoverageAddSchema = Type.Object(
 // ── Tool: PromoteFinding (phase 1) / ConfirmFinding (phase 2) ──────────
 //
 // Confirmation is TWO-PHASE and main-agent-owned: PromoteFinding runs the PoC
-// 2x + control, validates nonce-bound evidence.json, and records the pending
-// bundle; ConfirmFinding then performs the main coordinator's review/replay and
+// twice against the case target, validates nonce-bound evidence.json, replays
+// the attack and baseline requests itself, and records the pending bundle;
+// ConfirmFinding then performs the main coordinator's semantic review and
 // commits or refuses the verdict. Subagents may gather or challenge evidence,
 // but they cannot run validation or confirmation gates. Zero exit is necessary
-// run integrity and markers are diagnostic only; the machine records
-// predicate/canary differentials and the main agent owns the semantic judgment.
+// run integrity and markers are diagnostic only; the machine records the
+// predicate differential and the main agent owns the semantic judgment.
 
 const PromoteSchema = Type.Object(
   {
@@ -253,54 +237,11 @@ const PromoteSchema = Type.Object(
     poc_path: Type.String({
       description: "Absolute path to the PoC script on disk",
     }),
-    control_path: Type.Optional(
-      Type.String({
-        description:
-          "Optional absolute path to the SAME script as poc_path (sha256-equality is ENFORCED). Defaults to poc_path. The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
-      }),
-    ),
-    mode: Type.Optional(
-      Type.String({
-        enum: ["inter_host", "intra_target"],
-        description:
-          "Differential shape. 'inter_host' (default) proves target-dependence with a distinct patched control host — for body-carried proof (file read, injection exfil, info leak, reflection). 'intra_target' proves it with a legitimate same-host baseline request declared in the evidence — for access-control / business-logic classes (IDOR, auth bypass, privilege escalation, logic flaws) where the discriminating variable is identity or a parameter, not the host. In intra_target the evidence must set verify.mode='intra_target' and include a baseline; control_target/control_path are not used.",
-      }),
-    ),
-    control_target: Type.Optional(
-      Type.String({
-        minLength: 1,
-        description:
-          "REQUIRED for mode='inter_host': a distinct baseline target that lacks the vulnerability and is operator-approved through PI_POC_CONTROL_TARGETS (patched replica, second account, baseline service). Not used for mode='intra_target'.",
-      }),
-    ),
     local: Type.Optional(
       Type.Boolean({
         description:
           "Run with network access instead of --network none. Requires operator authorization via PI_POC_ALLOW_NETWORK=1. True host fallback additionally requires PI_POC_ALLOW_LOCAL=1.",
       }),
-    ),
-    oob: Type.Optional(
-      Type.Boolean({
-        description:
-          "Blind/OOB confirmation via the operator-run oracle (PI_OOB_ORACLE_URL). The harness provisions per-run callback tokens, injects PI_POC_CALLBACK_DOMAIN into the runs, and polls the oracle itself: promotion requires target-token interactions, ZERO control-token interactions, attested source separation (PI_OOB_SOURCE_SEPARATED=1), and self-source/missing-src_ip interactions are rejected. Without an oracle this fails closed.",
-      }),
-    ),
-    panel_votes: Type.Optional(
-      Type.Array(
-        Type.Object(
-          {
-            verdict: Type.String({ enum: [...PANEL_VERDICT_VALUES] }),
-            rationale: Type.String({ description: "Why this voter reached its verdict" }),
-            model: Type.String({ description: "Which model voted" }),
-            at: Type.Optional(Type.String({ description: "Vote timestamp (ISO)" })),
-          },
-          { additionalProperties: false },
-        ),
-        {
-          description:
-            "Optional pre-gate panel votes (≤5). CONFIRMED later requires a 2/3 exploit quorum or an explicit override note on the verdict; votes never commit anything.",
-        },
-      ),
     ),
   },
   { additionalProperties: false },
@@ -321,12 +262,12 @@ const ConfirmSchema = Type.Object(
         re_execution_note: Type.Optional(
           Type.String({
             description:
-              "What the main agent observed during review and the fresh harness-owned target/control replay. Mandatory for CONFIRMED.",
+              "What the main agent observed during review of the runs and transcripts. Mandatory for CONFIRMED.",
           }),
         ),
         differential: Type.String({
           enum: [...CONFIRM_DIFFERENTIAL_VALUES],
-          description: "Target vs control evidence comparison. CONFIRMED requires target_only.",
+          description: "Attack vs baseline evidence comparison. CONFIRMED requires target_only.",
         }),
         severity_match: Type.Optional(
           Type.String({
@@ -338,25 +279,6 @@ const ConfirmSchema = Type.Object(
           Type.String({
             description:
               "The main agent's own failed attempt to disprove — becomes the case's disconfirmation",
-          }),
-        ),
-        canary_assessment: Type.Optional(
-          Type.String({
-            enum: [...CANARY_ASSESSMENT_VALUES],
-            description:
-              "verified when the replay carried a harness-generated reflection canary; otherwise not_applicable with a concrete reason",
-          }),
-        ),
-        canary_reason: Type.Optional(
-          Type.String({
-            description:
-              "Why a causal reflection canary is not meaningful for this exploit class. Required when canary_assessment=not_applicable.",
-          }),
-        ),
-        panel_override_note: Type.Optional(
-          Type.String({
-            description:
-              "Why CONFIRMED proceeds without a 2/3 exploit panel quorum (panel skipped, unavailable, or documented disagreement). Required for CONFIRMED whenever quorum was not reached.",
           }),
         ),
         model: Type.Optional(
@@ -1005,19 +927,15 @@ export default function casefileExtension(pi: ExtensionAPI) {
       name: "PromoteFinding",
       label: "Run PoC Evidence",
       description:
-        "Main-agent phase 1 of confirmation: run the same PoC twice against the case target and once against an operator-approved control_target, validate nonce-bound evidence.json with a response-body assertion, then have the harness execute one immutable HTTP request template against both target and control. control_path defaults to poc_path; if supplied, sha256 equality is enforced. The machine records a predicate differential, or a stronger canary differential when a reflection placeholder is requested and observed only on target; neither is automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Networked execution, controls, and private replay are operator-gated. Blind/OOB confirmation fails closed until source separation exists. Records a pending bundle for main-agent semantic review via ConfirmFinding. Worker/subagent processes are rejected.",
-      promptSnippet:
-        "Phase 1: run PoC evidence (target x2 + control) and record the pending bundle",
+        "Main-agent phase 1 of confirmation: run the same PoC twice against the case target, validate nonce-bound evidence.json with a response-body assertion, then have the harness replay the attack request and a legitimate same-host baseline request itself. The machine records a predicate differential (attack matched, baseline did not); that is not automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Networked execution and private replay are operator-gated. Records a pending bundle for main-agent semantic review via ConfirmFinding. Worker/subagent processes are rejected.",
+      promptSnippet: "Phase 1: run PoC evidence (target x2) and record the pending bundle",
       promptGuidelines: [
         "Use PromoteFinding only from the main/coordinator agent when an investigating case has a concrete PoC script on disk and you are ready to subject its claim to the machine gate.",
         "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The final disconfirmation comes from the main agent at confirm time.",
-        "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url must belong to the case target.",
-        "For reflection-capable requests, place {{PI_POC_CANARY}} exactly once in verify.url/body/header values and declare verify.canary={mode:'reflection',placeholder:'{{PI_POC_CANARY}}'}. The harness substitutes an unpredictable value only after the PoC exits and requires target-only reflection; the raw token is not persisted.",
-        "control_path is optional and defaults to poc_path; if supplied, it must be the SAME script as poc_path. control_target must be pre-approved by the operator in PI_POC_CONTROL_TARGETS. The harness derives the control request from the target request, changes only its origin, and applies the same predicates to two conclusive responses.",
-        "oob=true unlocks blind/OOB classes (SSRF, blind XSS, XXE): the harness provisions per-run callback tokens via the operator's oracle (PI_OOB_ORACLE_URL), injects PI_POC_CALLBACK_DOMAIN into the runs, and polls the oracle itself — target-token interactions with ZERO control-token interactions are required. Promotion additionally requires attested source separation (PI_OOB_SOURCE_SEPARATED=1); without it the verification stays diagnostic.",
+        "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations, baseline }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url and baseline.url must belong to the case target.",
+        "baseline is a legitimate same-host request whose response must NOT satisfy the attack predicate — your own account's resource for IDOR, the request without the payload for injection. It must differ from the attack request (identity or a parameter, not just whitespace).",
         "local:true requires PI_POC_ALLOW_NETWORK=1. Private/internal harness replay additionally requires PI_POC_ALLOW_PRIVATE_REPLAY=1. Neither silently falls back to a model verdict.",
-        "Blind/OOB classes fail closed unless the operator configured an OOB oracle; self-interactions (PI_OOB_SELF_IPS) are rejected and never counted as target hits.",
-        "After the bundle is recorded, stay in the main agent: inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding itself; that call performs a fresh harness-owned target/control replay. Never delegate validation/confirmation and never CaseUpdate status='confirmed' directly.",
+        "After the bundle is recorded, stay in the main agent: inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding yourself. Never delegate validation/confirmation and never CaseUpdate status='confirmed' directly.",
       ],
       parameters: PromoteSchema,
 
@@ -1039,155 +957,60 @@ export default function casefileExtension(pi: ExtensionAPI) {
         };
 
         const pocPath = (params.poc_path as string | undefined)?.trim() ?? "";
-        const controlPath = (params.control_path as string | undefined)?.trim() || pocPath;
-        const controlTarget = (params.control_target as string | undefined)?.trim() ?? "";
-        const mode: "inter_host" | "intra_target" =
-          (params.mode as string | undefined) === "intra_target" ? "intra_target" : "inter_host";
-        const isIntra = mode === "intra_target";
         if (!pocPath) {
           return fail("poc_path is REQUIRED: absolute path to the PoC script run by the harness.");
         }
         const caseTarget = current.target ?? "";
-        // Panel votes (advisory pre-gate): validated here so a malformed panel
-        // is rejected before any sandboxed run is paid for.
-        let panelVotes: PendingConfirmation["panelVotes"];
-        if (params.panel_votes !== undefined) {
-          const parsedVotes = validatePanelVotes(params.panel_votes);
-          if (!parsedVotes.ok) {
-            return fail(`Invalid panel_votes: ${parsedVotes.error}`);
-          }
-          panelVotes = parsedVotes.votes;
-        }
-        // ── OOB callback (Tier 1, opt-in for blind classes) ──
-        // The operator-run oracle owns the evidence channel; the harness owns
-        // the secret (per-run token, provisioned before the runs and injected
-        // as env — the value does not exist when the script was written).
-        // Without an oracle this stays fail-closed.
-        const oobRequested = params.oob === true;
-        // Intra-target + OOB is rejected up front: intra_target's
-        // discriminating variable is identity/parameter on the SAME host;
-        // mixing it with a callback differential would make precedence
-        // ambiguous. OOB is for inter-host/blind classes.
-        if (isIntra && oobRequested) {
-          return fail(
-            "mode:'intra_target' cannot be combined with oob:true — intra-target proof uses a same-host baseline request, not a callback channel. Use one or the other.",
-          );
-        }
-        let oobConfig: OobOracleConfig | undefined;
-        let targetCallback: ProvisionedCallback | undefined;
-        let controlCallback: ProvisionedCallback | undefined;
-        if (oobRequested) {
-          const oracle = readOobOracleConfig();
-          if (!oracle.config) {
-            return fail(`OOB CONFIRMATION UNAVAILABLE: ${oracle.error}`);
-          }
-          oobConfig = oracle.config;
-          // Provision both identities concurrently — each is an oracle round trip.
-          [targetCallback, controlCallback] = await Promise.all([
-            provisionCallback(oobConfig),
-            provisionCallback(oobConfig),
-          ]);
-        }
-        // OOB-only bundles (blind classes, no operator-approved control host)
-        // prove target-dependence via the token differential instead.
-        const oobOnly = oobRequested && !controlTarget;
-        if (!isIntra && !oobOnly) {
-          if (!controlTarget) {
-            return fail(
-              "control_target is REQUIRED for inter-host mode: a distinct baseline target that lacks the vulnerability. For access-control/logic bugs use mode='intra_target' with an evidence baseline instead; for blind/OOB classes pass oob=true (with or without a control target).",
-            );
-          }
-          if (controlTarget === current.target) {
-            return fail(
-              "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
-            );
-          }
-        }
         if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
           return fail(
             "Networked PoC execution is operator-gated. Set PI_POC_ALLOW_NETWORK=1 to authorize the host-network sandbox for this session.",
           );
         }
-        if (!isIntra && !oobOnly) {
-          const controlAuthorization = controlTargetAuthorizationError(controlTarget);
-          if (controlAuthorization) {
-            return fail(
-              `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
-                "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
-            );
-          }
-        }
 
-        // Anti-cheat: hash the PoC (always) and, for inter-host, require the
-        // control script to be the SAME bytes (differing only via harness env).
+        // Anti-cheat: hash the PoC so the recorded bundle is bound to the exact
+        // bytes that ran (re-verified at confirm time).
         let pocHash: string | undefined;
         try {
           pocHash = createHash("sha256").update(readFileSync(pocPath)).digest("hex");
         } catch (e) {
           return fail(`Cannot read PoC script: ${(e as Error).message}`);
         }
-        if (!isIntra && !oobOnly) {
-          let controlHash: string | undefined;
-          try {
-            controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
-          } catch (e) {
-            return fail(
-              `Cannot read control script for the same-file check: ${(e as Error).message}`,
-            );
-          }
-          if (pocHash !== controlHash) {
-            return fail(
-              "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
-            );
-          }
-        }
 
-        // ── OOB callback tokens were provisioned above, before the runs ──
-        const runOptions = (pocMode: string, target: string): PocRunOptions => ({
+        const runOptions = (target: string): PocRunOptions => ({
           network: params.local === true ? "host" : "none",
           local: params.local === true,
           env: {
-            PI_POC_MODE: pocMode,
+            PI_POC_MODE: "poc",
             PI_POC_TARGET: target,
-            ...(oobRequested && targetCallback && controlCallback
-              ? {
-                  PI_POC_CALLBACK_DOMAIN:
-                    pocMode === "control" ? controlCallback.domain : targetCallback.domain,
-                }
-              : {}),
           },
         });
 
         // Determinism: TWO target runs. Exit 0 is run integrity only; nonce-bound
-        // body evidence plus the harness-owned differential replay (inter-host
-        // control, or intra-target same-host baseline) form the machine gate.
-        const run1 = runPoc(pocPath, runOptions("poc", caseTarget));
-        const run2 = runPoc(pocPath, runOptions("poc", caseTarget));
+        // body evidence plus the harness-owned attack/baseline replay form the
+        // machine gate.
+        const run1 = runPoc(pocPath, runOptions(caseTarget));
+        const run2 = runPoc(pocPath, runOptions(caseTarget));
 
-        const evidenceRun = (
-          r: PocRun,
-          mode: "poc" | "control",
-          target: string,
-        ): PocEvidenceRun => {
+        const evidenceRun = (r: PocRun, target: string): PocEvidenceRun => {
           if (!r.completed || !r.outputComplete) {
             return fail(
-              `${mode} run did not complete or output capture was incomplete` +
+              `PoC run did not complete or output capture was incomplete` +
                 (r.infraError ? ` (infra: ${r.output.trim()})` : "") +
                 ". A crash is not evidence. Case remains investigating.",
             );
           }
           if (r.evidenceError) {
             return fail(
-              `EVIDENCE CONTRACT FAILED (${mode} run): ${r.evidenceError}. ` +
-                "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains / body_regex } }, observations }; a response-body assertion is mandatory — " +
+              `EVIDENCE CONTRACT FAILED: ${r.evidenceError}. ` +
+                "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains / body_regex } }, observations, baseline }; a response-body assertion is mandatory — " +
                 "the file is bound to this run and validated by the harness. Case remains investigating.",
             );
           }
           if (!r.evidence || !r.evidenceSha256 || !r.nonce) {
-            return fail(`${mode} run produced no evidence. Case remains investigating.`);
+            return fail("PoC run produced no evidence. Case remains investigating.");
           }
           return {
-            mode,
+            mode: "poc",
             target,
             nonce: r.nonce,
             ranAt: r.ranAt,
@@ -1203,89 +1026,26 @@ export default function casefileExtension(pi: ExtensionAPI) {
         };
 
         const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
-          evidenceRun(run1, "poc", caseTarget),
-          evidenceRun(run2, "poc", caseTarget),
+          evidenceRun(run1, caseTarget),
+          evidenceRun(run2, caseTarget),
         ];
 
-        // Reflection canary + OOB is rejected after run 1 (the canary is
-        // declared inside evidence.json): the canary path requires a harness
-        // response transcript, which OOB-only bundles never produce — the
-        // per-run callback token IS the causality signal there.
-        if (oobRequested && targetRuns.some((r) => r.evidence.verify.canary !== undefined)) {
-          return fail(
-            "verify.canary cannot be combined with oob:true — the per-run callback token already provides a harness-owned causality signal. Remove the {{PI_POC_CANARY}} placeholder and verify.canary from evidence.json, then re-promote.",
-          );
-        }
         const allowPrivateReplay = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
-        let harnessVerified: HarnessVerifyResult | undefined;
-        let controlRun: PocEvidenceRun | undefined;
-        if (isIntra) {
-          // Intra-target: prove target-dependence with the evidence's same-host
-          // baseline request — no separate control run. The harness sends attack +
-          // baseline to the case target and requires the proof on attack only.
-          const ev0 = targetRuns[0].evidence;
-          if (ev0.verify.mode !== "intra_target") {
-            return fail(
-              "INTRA-TARGET FAILED: the PoC's evidence.json must set verify.mode='intra_target' when promoting in intra-target mode.",
-            );
-          }
-          if (!ev0.baseline) {
-            return fail(
-              "INTRA-TARGET FAILED: evidence.json must include a baseline — a legitimate same-host request whose response must NOT satisfy the attack predicate.",
-            );
-          }
-          harnessVerified = await replayIntraTarget(ev0, caseTarget, {
-            allowPrivate: allowPrivateReplay,
-          });
-        } else if (!oobOnly) {
-          // Inter-host (Tier 2): the harness executes the SAME request template
-          // against target and operator-approved control, applying the target's
-          // predicates to both. DNS is pinned at connect time.
-          controlRun = evidenceRun(
-            runPoc(controlPath, runOptions("control", controlTarget)),
-            "control",
-            controlTarget,
-          );
-          harnessVerified = await replayDifferential(
-            targetRuns[0].evidence,
-            caseTarget,
-            controlTarget,
-            { allowPrivate: allowPrivateReplay },
-          );
-        }
-        // OOB differential: poll the oracle for both run tokens. The ledger's
-        // assertMachineConfirmation consumes this BEFORE the response-diff
-        // requirement — blind classes pass via this path when the oracle saw
-        // the target token and NOT the control token under attested source
-        // separation.
-        let callbackVerified: OobVerification | undefined;
-        if (oobConfig && targetCallback && controlCallback) {
-          callbackVerified = (
-            await verifyOobDifferential({
-              targetToken: targetCallback.token,
-              controlToken: controlCallback.token,
-            })
-          ).verification;
-        }
+        // Intra-target differential: prove target-dependence with the evidence's
+        // same-host baseline request. The harness sends attack + baseline to the
+        // case target and requires the proof on attack only.
+        const harnessVerified: HarnessVerifyResult = await replayIntraTarget(
+          targetRuns[0].evidence,
+          caseTarget,
+          { allowPrivate: allowPrivateReplay },
+        );
         const bundle: PendingConfirmation = {
           caseId,
           ranAt: new Date().toISOString(),
           pocPath,
           pocSha256: pocHash,
-          mode,
           targetRuns,
           harnessVerified,
-          ...(panelVotes ? { panelVotes } : {}),
-          ...(callbackVerified && targetCallback && controlCallback
-            ? {
-                callbackVerified,
-                oobTokens: {
-                  targetToken: targetCallback.token,
-                  controlToken: controlCallback.token,
-                },
-              }
-            : {}),
-          ...(!(isIntra || oobOnly) ? { controlPath, controlTarget, controlRun } : {}),
         };
 
         let record: CaseRecord;
@@ -1301,15 +1061,12 @@ export default function casefileExtension(pi: ExtensionAPI) {
               type: "text",
               text:
                 `Phase 1 complete — evidence bundle recorded on ${caseId} (expires in 1h).\n` +
-                `Mode: ${mode}. ${isIntra ? "Target runs: 2, same-host baseline differential" : "Target runs: 2, Control run: 1"} — all with validated nonce-bound evidence.json.\n` +
+                `Target runs: 2, same-host baseline differential — all with validated nonce-bound evidence.json.\n` +
                 `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
                 `PoC script sha256 (at run time): ${pocHash}\n` +
                 `Harness verify replay: ${harnessVerified?.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : (harnessVerified?.note ?? "not run")}
 ` +
-                (callbackVerified
-                  ? `OOB oracle: target-token hits ${callbackVerified.targetHits}, control-token hits ${callbackVerified.controlHits}, source-separated: ${String(callbackVerified.sourceSeparated)} — ${callbackVerified.note}\n`
-                  : "") +
-                `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, ${isIntra ? "same-host baseline" : `control ${controlTarget}`}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned ${isIntra ? "attack/baseline" : "target/control"} replay; NOT_CONFIRMED keeps the case investigating.`,
+                `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, the same-host baseline, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. NOT_CONFIRMED keeps the case investigating.`,
             },
           ],
           details: {
@@ -1317,10 +1074,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
             bundle: {
               caseId,
               ranAt: bundle.ranAt,
-              mode,
               pocPath,
-              controlPath: isIntra ? undefined : controlPath,
-              controlTarget: isIntra ? undefined : controlTarget,
               pocSha256: pocHash,
               evidenceSha256: targetRuns[0].evidenceSha256,
               harnessVerified,
@@ -1358,15 +1112,15 @@ export default function casefileExtension(pi: ExtensionAPI) {
       name: "ConfirmFinding",
       label: "Main-Agent Confirmation",
       description:
-        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after independently re-testing the finding. On CONFIRMED, this tool performs a fresh harness-owned target/control replay; the verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, a canary assessment, and the still-valid PromoteFinding bundle. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. Three verdicts: CONFIRMED (you reproduced real impact), NOT_CONFIRMED (you POSITIVELY disproved it), INCONCLUSIVE (you could neither reproduce nor disprove — the case is preserved for manual review, never dropped).",
+        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after independently reviewing the recorded evidence. The verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, and the still-valid PromoteFinding bundle. The machine floor is the promote-time harness replay plus confirm-time bundle re-validation — there is no fresh network replay at verdict time, so weigh bundle age (1h TTL) in your review. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. Three verdicts: CONFIRMED (you reproduced real impact), NOT_CONFIRMED (you POSITIVELY disproved it), INCONCLUSIVE (you could neither reproduce nor disprove — the case is preserved for manual review, never dropped).",
       promptSnippet: "Main agent: independently re-test, then commit or refuse PoC confirmation",
       promptGuidelines: [
         "Run only in the main/coordinator agent after PromoteFinding returns. Do not dispatch a worker to decide or author this verdict.",
-        "Verify with DISBELIEF: assume the finding is a false positive until your OWN re-test proves otherwise. Reproduce the exact observable yourself from the primary evidence (not the hunter's narrative), with a negative/baseline control — a difference you cannot tie to the control is not proof. ConfirmFinding itself re-sends the immutable verify request against target and operator-approved control so phase 2 has a harness-owned transcript.",
+        "Verify with DISBELIEF: assume the finding is a false positive until the recorded evidence proves otherwise. Read the PoC script, both run transcripts, the attack/baseline replay, and the evidence artifacts (not the hunter's narrative) — a difference you cannot tie to the baseline is not proof.",
         "Provenance: the proof must exercise THIS finding's own mechanism. Evidence obtained through a DIFFERENT bug (e.g. 'SQLi' proven by dumping the DB via an RCE) does not confirm it — that is INCONCLUSIVE at best.",
         "Kill the cheapest benign explanation: is this the technology's intended behavior? Did the attacker supply the 'secret' themselves (circular)? Is the claimed C/I/A impact actually demonstrated?",
         "Want a second pair of eyes? Dispatch a read-only skeptic subagent to re-test — it CANNOT confirm (only the main agent commits). You review its verdict and commit it here.",
-        "CONFIRMED requires differential: 'target_only', re_execution_note, and disconfirmation_attempt (your failed disproof). A verdict missing any of these is rejected. Set canary_assessment='verified' when the immutable request declared a canary; otherwise not_applicable with a reason.",
+        "CONFIRMED requires differential: 'target_only', re_execution_note, and disconfirmation_attempt (your failed disproof). A verdict missing any of these is rejected.",
         "NOT_CONFIRMED means you POSITIVELY disproved it (by-design, circular, mislabeled, no impact). Never mark NOT_CONFIRMED merely because you could not reproduce it.",
         "INCONCLUSIVE when you could neither reproduce nor disprove (needs auth, a second account, specific state, timing, or a blind/stored trigger you cannot observe). The case stays investigating and is preserved for manual review — dropping a real finding is worse than keeping an unproven one.",
         "Every verdict consumes the attempt: a fresh PromoteFinding run is required to try again. Never CaseUpdate status='confirmed' directly — always PromoteFinding + ConfirmFinding.",
@@ -1384,83 +1138,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         if (!parsedVerdict.ok) {
           throw new Error(`Invalid main-agent confirmation verdict: ${parsedVerdict.error}`);
         }
-        let phase2Verification: MainAgentVerification | undefined;
-        if (parsedVerdict.verdict.verdict === "CONFIRMED") {
-          const current = getCaseById(caseId);
-          if (!current) throw new Error(`Case not found: ${caseId}`);
-          const bundle = current.pendingConfirmation;
-          if (!bundle) {
-            throw new Error("No pending confirmation on this case — run PromoteFinding first");
-          }
-          const allowPrivate = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
-          const caseTargetForReplay = current.target ?? bundle.targetRuns[0].target;
-          let replay: HarnessVerifyResult;
-          if (bundle.mode === "intra_target") {
-            // Same-host attack-vs-baseline replay; no control target to authorize.
-            replay = await replayIntraTarget(bundle.targetRuns[0].evidence, caseTargetForReplay, {
-              allowPrivate,
-            });
-          } else if (bundle.callbackVerified?.attempted && bundle.oobTokens) {
-            // OOB differential: fresh harness-owned re-poll of BOTH run tokens.
-            // Re-polling at confirm time catches interactions that landed after
-            // phase 1 (e.g. a delayed control-token hit) — the verdict is bound
-            // to this fresh observation, not the stored one.
-            const { verification } = await verifyOobDifferential({
-              targetToken: bundle.oobTokens.targetToken,
-              controlToken: bundle.oobTokens.controlToken,
-            });
-            const oobPass =
-              verification.targetHits > 0 &&
-              verification.controlHits === 0 &&
-              verification.sourceSeparated === true;
-            replay = {
-              attempted: true,
-              pass: oobPass,
-              target: {
-                attempted: true,
-                matched: verification.targetHits > 0,
-                url: bundle.targetRuns[0].evidence.verify.url,
-                note: verification.note,
-              },
-              control: {
-                attempted: true,
-                matched: verification.controlHits > 0,
-                url: bundle.targetRuns[0].evidence.verify.url,
-                note: `${verification.controlHits} control-token interaction(s)`,
-              },
-              differential:
-                verification.targetHits > 0
-                  ? verification.controlHits === 0
-                    ? "target_only"
-                    : "both"
-                  : "neither",
-              note: `harness OOB re-poll: ${verification.note}`,
-            };
-          } else if (bundle.callbackVerified?.attempted) {
-            throw new Error(
-              "OOB bundle lacks its provisioned tokens (pre-token-storage ledger) — re-run PromoteFinding for a fresh bundle",
-            );
-          } else {
-            if (!bundle.controlTarget) {
-              throw new Error("inter-host confirmation requires a control target");
-            }
-            const controlAuthorizationError = controlTargetAuthorizationError(bundle.controlTarget);
-            if (controlAuthorizationError) {
-              throw new Error(`CONTROL AUTHORIZATION FAILED: ${controlAuthorizationError}`);
-            }
-            replay = await replayDifferential(
-              bundle.targetRuns[0].evidence,
-              caseTargetForReplay,
-              bundle.controlTarget,
-              { allowPrivate },
-            );
-          }
-          phase2Verification = {
-            at: new Date().toISOString(),
-            result: replay,
-          };
-        }
-        const result = applyConfirmationResult(caseId, parsedVerdict.verdict, phase2Verification, {
+        const result = applyConfirmationResult(caseId, parsedVerdict.verdict, {
           startedAsSubagent: isSubagentProcess(),
         });
         const record = result.record;

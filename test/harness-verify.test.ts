@@ -1,17 +1,23 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { isPublicIpAddress as sharedIsPublicIpAddress } from "@xaccefy/pi-shared";
-import { POC_CANARY_PLACEHOLDER, type PoCEvidence, parsePoCEvidence } from "../src/evidence.ts";
+import { type PoCEvidence, parsePoCEvidence } from "../src/evidence.ts";
 import {
-  controlTargetAuthorizationError,
   evaluateExpect,
   isPublicIpAddress as harnessIsPublicIpAddress,
-  replayDifferential,
   replayIntraTarget,
 } from "../src/harness-verify.ts";
 
-/** Minimal valid evidence whose verify.url the caller overrides. */
-function evidence(overrides: Partial<PoCEvidence["verify"]> = {}): PoCEvidence {
+const DEFAULT_BASELINE: PoCEvidence["baseline"] = {
+  method: "GET",
+  url: "https://example.com/read?file=report.txt",
+};
+
+/** Minimal valid evidence whose verify request the caller overrides. */
+function evidence(
+  overrides: Partial<PoCEvidence["verify"]> = {},
+  baseline: PoCEvidence["baseline"] = DEFAULT_BASELINE,
+): PoCEvidence {
   return {
     nonce: "n",
     claim: "read /etc/passwd of target",
@@ -22,6 +28,7 @@ function evidence(overrides: Partial<PoCEvidence["verify"]> = {}): PoCEvidence {
       ...overrides,
     },
     observations: ["root: present"],
+    baseline,
   };
 }
 
@@ -84,24 +91,6 @@ describe("harness-verify: evaluateExpect", () => {
     }
   });
 
-  it("requires exactly one fixed canary placeholder", () => {
-    const missing = parsePoCEvidence(
-      evidence({
-        canary: { mode: "reflection", placeholder: POC_CANARY_PLACEHOLDER },
-      }),
-    );
-    assert.strictEqual(missing.ok, false);
-    if (!missing.ok) assert.match(missing.error, /exactly one/);
-
-    const valid = parsePoCEvidence(
-      evidence({
-        url: `https://example.com/reflect?q=${POC_CANARY_PLACEHOLDER}`,
-        canary: { mode: "reflection", placeholder: POC_CANARY_PLACEHOLDER },
-      }),
-    );
-    assert.strictEqual(valid.ok, true);
-  });
-
   it("times out pathological PoC-authored regular expressions", async () => {
     const failures = await evaluateExpect(
       { body_regex: ["(a+)+$"] },
@@ -118,10 +107,9 @@ describe("harness-verify: replay policy (via the production differential path)",
   });
 
   it("refuses private IP literals without operator authorization", async () => {
-    const result = await replayDifferential(
-      evidence({ url: "http://127.0.0.1/read" }),
+    const result = await replayIntraTarget(
+      evidence({ url: "http://127.0.0.1/read" }, { method: "GET", url: "http://127.0.0.1/safe" }),
       "127.0.0.1",
-      "control.test",
     );
     assert.strictEqual(result.attempted, false);
     assert.match(result.note, /private\/internal host/);
@@ -129,10 +117,12 @@ describe("harness-verify: replay policy (via the production differential path)",
 
   it("uses the shared classifier to reject 6to4 and Teredo literals", async () => {
     for (const host of ["2002:c0a8:0101::1", "2001:0000:4136:e378:8000:63bf:3fff:fdd2"]) {
-      const result = await replayDifferential(
-        evidence({ url: `http://[${host}]/proof` }),
+      const result = await replayIntraTarget(
+        evidence(
+          { url: `http://[${host}]/proof` },
+          { method: "GET", url: `http://[${host}]/safe` },
+        ),
         `[${host}]`,
-        "control.test",
       );
       assert.strictEqual(result.attempted, false, host);
       assert.match(result.note, /private\/internal/);
@@ -141,10 +131,9 @@ describe("harness-verify: replay policy (via the production differential path)",
 
   it("skips localhost and .localhost hostnames", async () => {
     for (const host of ["localhost", "app.localhost"]) {
-      const result = await replayDifferential(
-        evidence({ url: `http://${host}/read` }),
+      const result = await replayIntraTarget(
+        evidence({ url: `http://${host}/read` }, { method: "GET", url: `http://${host}/safe` }),
         host,
-        "control.test",
       );
       assert.strictEqual(result.attempted, false, host);
     }
@@ -154,10 +143,12 @@ describe("harness-verify: replay policy (via the production differential path)",
     // .invalid is guaranteed NXDOMAIN (RFC 2606) — deterministic, offline.
     // The generous timeout covers slow resolvers under parallel suite load;
     // resolveHost's internal 5s cap still bounds the wait.
-    const result = await replayDifferential(
-      evidence({ url: "http://does-not-exist.invalid/read" }),
+    const result = await replayIntraTarget(
+      evidence(
+        { url: "http://does-not-exist.invalid/read" },
+        { method: "GET", url: "http://does-not-exist.invalid/safe" },
+      ),
       "does-not-exist.invalid",
-      "control.test",
     );
     assert.strictEqual(result.attempted, true);
     assert.strictEqual(result.pass, false);
@@ -165,11 +156,7 @@ describe("harness-verify: replay policy (via the production differential path)",
   });
 
   it("skips non-http verify URLs (binding fails closed)", async () => {
-    const result = await replayDifferential(
-      evidence({ url: "file:///etc/passwd" }),
-      "example.com",
-      "control.test",
-    );
+    const result = await replayIntraTarget(evidence({ url: "file:///etc/passwd" }), "example.com");
     assert.strictEqual(result.attempted, false);
   });
 
@@ -182,16 +169,20 @@ describe("harness-verify: replay policy (via the production differential path)",
         headers: { location: "http://127.0.0.1/private" },
       });
     };
-    const result = await replayDifferential(
-      evidence({ url: "http://93.184.216.34/start" }),
+    const result = await replayIntraTarget(
+      evidence(
+        { url: "http://93.184.216.34/start" },
+        { method: "GET", url: "http://93.184.216.34/baseline" },
+      ),
       "93.184.216.34",
-      "control.test",
       { fetchImpl },
     );
     assert.strictEqual(result.pass, false);
-    // Each request fetches exactly once: the initial hop only — the loopback
-    // redirect Location is never fetched.
-    assert.deepStrictEqual(requested, ["http://93.184.216.34/start", "http://control.test/start"]);
+    // The loopback redirect Location is never fetched; the baseline is.
+    assert.deepStrictEqual(requested, [
+      "http://93.184.216.34/start",
+      "http://93.184.216.34/baseline",
+    ]);
     assert.match(result.note, /private\/internal host|redirect left the bound host/);
   });
 
@@ -204,123 +195,22 @@ describe("harness-verify: replay policy (via the production differential path)",
         headers: { location: "https://unrelated.example/proof" },
       });
     };
-    const result = await replayDifferential(evidence(), "example.com", "control.test", {
-      fetchImpl,
-    });
+    const result = await replayIntraTarget(evidence(), "example.com", { fetchImpl });
     assert.strictEqual(result.pass, false);
     assert.deepStrictEqual(requested, [
       "https://example.com/read?file=/etc/passwd",
-      "http://control.test/read?file=/etc/passwd",
+      "https://example.com/read?file=report.txt",
     ]);
     assert.match(result.note, /redirect left the bound host/);
   });
 
   it("treats a truncated response as inconclusive even if its prefix matches", async () => {
-    const result = await replayDifferential(evidence(), "example.com", "control.test", {
+    const result = await replayIntraTarget(evidence(), "example.com", {
       fetchImpl: async () => new Response(`root:${"x".repeat(2 * 1024 * 1024)}`),
     });
     assert.strictEqual(result.pass, false);
     assert.strictEqual(result.target?.matched, undefined);
     assert.match(result.note, /capture limit.*inconclusive/i);
-  });
-});
-
-describe("harness-verify: machine differential", () => {
-  it("applies the target request and predicates to both target and control", async () => {
-    const requested: string[] = [];
-    const fetchImpl = async (input: string | URL) => {
-      const url = new URL(String(input));
-      requested.push(url.toString());
-      return url.hostname === "target.test"
-        ? new Response("root:x:0:0", { status: 200 })
-        : new Response("not vulnerable", { status: 404 });
-    };
-    const result = await replayDifferential(
-      evidence({ url: "http://target.test/read?file=/etc/passwd" }),
-      "target.test",
-      "control.test",
-      { allowPrivate: true, fetchImpl },
-    );
-    assert.strictEqual(result.pass, true);
-    assert.strictEqual(result.differential, "target_only");
-    assert.strictEqual(result.target?.matched, true);
-    assert.strictEqual(result.control?.matched, false);
-    assert.deepStrictEqual(requested, [
-      "http://target.test/read?file=/etc/passwd",
-      "http://control.test/read?file=/etc/passwd",
-    ]);
-  });
-
-  it("treats a control transport failure as inconclusive, never target-only", async () => {
-    const fetchImpl = async (input: string | URL) => {
-      const url = new URL(String(input));
-      if (url.hostname === "control.test") throw new Error("control unavailable");
-      return new Response("root:x:0:0", { status: 200 });
-    };
-    const result = await replayDifferential(
-      evidence({ url: "http://target.test/read?file=/etc/passwd" }),
-      "target.test",
-      "control.test",
-      { allowPrivate: true, fetchImpl },
-    );
-    assert.strictEqual(result.pass, false);
-    assert.strictEqual(result.differential, undefined);
-    assert.match(result.note, /inconclusive/);
-  });
-
-  it("injects an unpredictable canary after PoC output and requires target-only reflection", async () => {
-    let observedToken = "";
-    const fetchImpl = async (input: string | URL) => {
-      const url = new URL(String(input));
-      const token = url.searchParams.get("marker") ?? "";
-      assert.match(token, /^poc_canary_[a-f0-9]{48}$/);
-      observedToken = token;
-      return url.hostname === "target.test"
-        ? new Response(`root:${token}`, { status: 200 })
-        : new Response("not vulnerable", { status: 404 });
-    };
-    const result = await replayDifferential(
-      evidence({
-        url: `http://target.test/read?marker=${POC_CANARY_PLACEHOLDER}`,
-        canary: { mode: "reflection", placeholder: POC_CANARY_PLACEHOLDER },
-      }),
-      "target.test",
-      "control.test",
-      { allowPrivate: true, fetchImpl },
-    );
-    assert.strictEqual(result.pass, true);
-    assert.strictEqual(result.canary?.pass, true);
-    assert.strictEqual(result.canary?.targetObserved, true);
-    assert.strictEqual(result.canary?.controlObserved, false);
-    assert.strictEqual(result.proofStrength, "canary_differential");
-    assert.ok(observedToken);
-    assert.ok(!JSON.stringify(result).includes(observedToken), "raw canary is not persisted");
-  });
-
-  it("rejects a verify URL that is not bound to the case target", async () => {
-    const result = await replayDifferential(
-      evidence({ url: "https://unrelated.test/proof" }),
-      "target.test",
-      "control.test",
-    );
-    assert.strictEqual(result.attempted, false);
-    assert.strictEqual(result.pass, false);
-    assert.match(result.note, /target binding failed/i);
-  });
-
-  it("requires the control identity to be operator-approved", () => {
-    assert.strictEqual(
-      controlTargetAuthorizationError("https://control.test", "control.test,baseline.test"),
-      undefined,
-    );
-    assert.match(
-      controlTargetAuthorizationError("invented.test", "control.test,baseline.test") ?? "",
-      /not present in the operator-approved/i,
-    );
-    assert.match(
-      controlTargetAuthorizationError("control.test", "") ?? "",
-      /no operator-approved/i,
-    );
   });
 });
 
@@ -335,7 +225,6 @@ describe("harness-verify: intra-target differential", () => {
         url: "http://target.test/api/orders/1001",
         headers: { authorization: "Bearer attacker" },
         expect: { status: [200], body_contains: ["victim-ssn:111-22-3333"] },
-        mode: "intra_target",
         ...overrides,
       },
       observations: ["victim ssn present"],
@@ -396,6 +285,21 @@ describe("harness-verify: intra-target differential", () => {
     assert.strictEqual(result.differential, "both");
   });
 
+  it("treats a baseline transport failure as inconclusive, never target-only", async () => {
+    const fetchImpl = async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/2002")) throw new Error("baseline unavailable");
+      return new Response("owner:victim victim-ssn:111-22-3333", { status: 200 });
+    };
+    const result = await replayIntraTarget(idorEvidence(), "target.test", {
+      allowPrivate: true,
+      fetchImpl,
+    });
+    assert.strictEqual(result.pass, false);
+    assert.strictEqual(result.differential, undefined);
+    assert.match(result.note, /inconclusive/);
+  });
+
   it("refuses an intra-target run whose attack and baseline are identical", async () => {
     const ev = idorEvidence();
     ev.baseline = {
@@ -410,12 +314,14 @@ describe("harness-verify: intra-target differential", () => {
     assert.match(result.note, /identical/);
   });
 
-  it("requires a baseline request", async () => {
-    const ev = idorEvidence();
-    ev.baseline = undefined;
-    const result = await replayIntraTarget(ev, "target.test", { allowPrivate: true });
+  it("rejects a verify URL that is not bound to the case target", async () => {
+    const result = await replayIntraTarget(
+      idorEvidence({ url: "https://unrelated.test/proof" }),
+      "target.test",
+    );
     assert.strictEqual(result.attempted, false);
-    assert.match(result.note, /requires evidence\.baseline/);
+    assert.strictEqual(result.pass, false);
+    assert.match(result.note, /attack binding failed/i);
   });
 
   it("binds the baseline to the case target so it cannot point at another host", async () => {
@@ -426,7 +332,7 @@ describe("harness-verify: intra-target differential", () => {
     assert.match(result.note, /baseline binding failed/i);
   });
 
-  it("parse requires baseline when verify.mode is intra_target", () => {
+  it("parse requires a baseline request in every evidence contract", () => {
     const missing = parsePoCEvidence({
       nonce: "n",
       claim: "c",
@@ -434,11 +340,10 @@ describe("harness-verify: intra-target differential", () => {
         method: "GET",
         url: "http://target.test/api/orders/1001",
         expect: { body_contains: ["victim-ssn:111-22-3333"] },
-        mode: "intra_target",
       },
       observations: [],
     });
     assert.strictEqual(missing.ok, false);
-    if (!missing.ok) assert.match(missing.error, /intra_target requires baseline/i);
+    if (!missing.ok) assert.match(missing.error, /requires baseline/i);
   });
 });

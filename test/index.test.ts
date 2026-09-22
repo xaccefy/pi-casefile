@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setHarnessFetchForTest } from "../src/harness-verify.ts";
 import { getCaseById, setCasefilePath } from "../src/ledger.ts";
-import { setOobOracleFetchForTest } from "../src/oob-oracle.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
 import { STATIC_RECON_WORKFLOW, STATIC_RECON_WORKFLOW_OMP } from "../src/workflow.ts";
 
@@ -58,7 +57,6 @@ type FakePi = {
 
 let tempDir: string;
 let pocScriptPath: string;
-let controlScriptPath: string;
 let observationArtifactPath: string;
 let disconfirmationScriptPath: string;
 let casefileExtension: (pi: any) => void;
@@ -122,14 +120,8 @@ async function executeTool(pi: FakePi, name: string, params: Record<string, unkn
       details: {
         record: typeof finalParams.id === "string" ? getCaseById(finalParams.id) : undefined,
         missingPocPath: text.includes("poc_path is REQUIRED"),
-        missingControlTarget: text.includes("control_target is REQUIRED"),
-        controlTargetEqualsCase: text.includes("control_target must differ from the case target"),
-        controlNotAuthorized: text.includes("CONTROL AUTHORIZATION FAILED"),
         evidenceFailed: text.includes("EVIDENCE CONTRACT FAILED"),
-        controlIdentical: text.includes("identical evidence to the target"),
-        controlBindingFailed: text.includes("CONTROL BINDING FAILED"),
         didNotComplete: /did not complete|did NOT complete/i.test(text),
-        sameFileCheckFailed: text.includes("sha256 mismatch"),
       },
     };
   }
@@ -140,11 +132,9 @@ beforeEach(async () => {
   setCasefilePath(join(tempDir, "casefile.db"));
   setScratchpadRoot(tempDir);
   pocScriptPath = join(tempDir, "shared.sh");
-  // Same-file contract: the control must be the SAME script as the PoC
-  // (sha256-equal; the only permitted difference is PI_POC_MODE). The shared
-  // fixture writes nonce-bound evidence.json per run, with mode-dependent
-  // content: the target run claims the vuln, the control run claims the
-  // baseline (so the machine differential passes).
+  // The fixture writes nonce-bound evidence.json per run: the attack request
+  // claims the vuln and a legitimate same-host baseline request (a different
+  // file) carries the differential control.
   writeFileSync(
     pocScriptPath,
     [
@@ -153,18 +143,13 @@ beforeEach(async () => {
       'mkdir -p "$E"',
       'T="$PI_POC_TARGET"',
       'case "$T" in http://*|https://*) ;; *) T="http://$T" ;; esac',
-      'if [ "$PI_POC_MODE" = "control" ]; then',
-      '  printf \'{"nonce":"%s","claim":"control baseline lacks the vuln","verify":{"method":"GET","url":"%s/read?file=/etc/passwd","expect":{"status":[403],"body_contains":["not vulnerable"]}},"observations":["control returned 403"]}\' "$PI_POC_NONCE" "$T" > "$E/evidence.json"',
-      "  exit 0",
-      "fi",
-      'printf \'{"nonce":"%s","claim":"read /etc/passwd of target","verify":{"method":"GET","url":"%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root: present"]}\' "$PI_POC_NONCE" "$T" > "$E/evidence.json"',
+      'printf \'{"nonce":"%s","claim":"read /etc/passwd of target","verify":{"method":"GET","url":"%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root: present"],"baseline":{"method":"GET","url":"%s/read?file=report.txt"}}\' "$PI_POC_NONCE" "$T" "$T" > "$E/evidence.json"',
       "printf 'ok'",
       "exit 0",
       "",
     ].join("\n"),
     "utf8",
   );
-  controlScriptPath = pocScriptPath;
   observationArtifactPath = join(tempDir, "observation.txt");
   writeFileSync(observationArtifactPath, "observed signal (fixture)", "utf8");
   disconfirmationScriptPath = join(tempDir, "disconf.sh");
@@ -178,12 +163,11 @@ beforeEach(async () => {
   process.env.PI_POC_FORCE_LOCAL = "1";
   process.env.PI_POC_ALLOW_NETWORK = "1";
   process.env.PI_POC_ALLOW_PRIVATE_REPLAY = "1";
-  process.env.PI_POC_CONTROL_TARGETS = "https://control.example,example-app";
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = new URL(String(input));
-    return url.hostname.includes("control")
-      ? new Response("not vulnerable", { status: 403 })
-      : new Response("root:x:0:0:root:/root:/bin/sh", { status: 200 });
+    return url.searchParams.get("file") === "/etc/passwd"
+      ? new Response("root:x:0:0:root:/root:/bin/sh", { status: 200 })
+      : new Response("report body", { status: 200 });
   }) as typeof fetch;
   setHarnessFetchForTest(globalThis.fetch as unknown as (input: string | URL) => Promise<Response>);
   // Hermeticity: the before_agent_start handler skips injection when
@@ -202,17 +186,8 @@ afterEach(async () => {
   delete process.env.PI_POC_FORCE_LOCAL;
   delete process.env.PI_POC_ALLOW_NETWORK;
   delete process.env.PI_POC_ALLOW_PRIVATE_REPLAY;
-  delete process.env.PI_POC_CONTROL_TARGETS;
   delete process.env.PI_SUBAGENT_CHILD;
-  delete process.env.PI_OOB_ORACLE_URL;
-  delete process.env.PI_OOB_ORACLE_TOKEN;
-  delete process.env.PI_OOB_SOURCE_SEPARATED;
-  delete process.env.PI_OOB_SELF_IPS;
-  delete process.env.PI_OOB_POLL_MS;
-  delete process.env.PI_OOB_INTERVAL_MS;
-  delete process.env.PI_OOB_SETTLE_MS;
   setHarnessFetchForTest(undefined);
-  setOobOracleFetchForTest(undefined);
   globalThis.fetch = nativeFetch;
   await rm(tempDir, { recursive: true, force: true });
 });
@@ -342,12 +317,10 @@ describe("casefile extension", () => {
     expect(updated.details.changed).toBe(true);
 
     // Phase 1: PromoteFinding records the evidence bundle (2 target runs +
-    // control); the case stays investigating until main-agent review.
+    // attack/baseline replay); the case stays investigating until review.
     const phase1 = await executeTool(pi, "PromoteFinding", {
       id: record.id,
       poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      control_path: controlScriptPath,
       local: true,
     });
     expect(phase1.details?.record?.status).toBe("investigating");
@@ -359,25 +332,20 @@ describe("casefile extension", () => {
       id: record.id,
       verdict: {
         verdict: "CONFIRMED",
-        reasoning: "re-sent the verify request: target returned the claimed entry, control did not",
-        evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (control run)"],
-        re_execution_note: "GET /read?file=/etc/passwd → 200 with root: on target; 403 on control",
+        reasoning: "reviewed the runs: attack returned the claimed entry, baseline did not",
+        evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (target run 2)"],
+        re_execution_note: "GET /read?file=/etc/passwd → 200 with root:; report.txt → no root:",
         differential: "target_only",
         severity_match: "ok",
         disconfirmation_attempt:
-          "tried /read?file=/etc/shadow and a patched replica → no entry; the effect is target-dependent",
-        canary_assessment: "not_applicable",
-        canary_reason: "file-read output has no attacker-reflected field",
+          "tried /read?file=/etc/shadow → no entry; the effect is specific to the attack parameter",
         model: "test-model",
-        panel_override_note: "test: panel not provisioned",
       },
     });
     expect(promoted.details.promoted).toBe(true);
     expect(promoted.details.record.status).toBe("confirmed");
     expect(promoted.details.record.confirmerVerdict?.reviewer).toBe("main_agent");
-    expect(promoted.details.record.confirmerVerdict?.phase2Verification?.result.differential).toBe(
-      "target_only",
-    );
+    expect(promoted.details.record.confirmerVerdict?.proofStrength).toBe("predicate_differential");
     expect(promoted.details.record.pocVerified?.exitCode).toBe(0);
     expect(promoted.details.record.evidence).toContain("PoC Execution Capture");
     expect(promoted.details.record.evidence).toContain("Target Run Output");
@@ -413,191 +381,6 @@ describe("casefile extension", () => {
     expect(contextText).toContain("Output\n```\nok\n```");
     expect(contextText).toContain("Complete Case Record");
     expect(contextText).toContain("Linked Cases");
-  });
-
-  test("PromoteFinding oob:true fails closed without an operator-configured oracle", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    const added = await addCase(pi, {
-      title: "OOB without network",
-      status: "investigating",
-      evidence: "blind SSRF suspected",
-      confidence: "high",
-      severity: "high",
-      poc: "send callback payload",
-      impact: "internal fetch",
-      target: "oob-app",
-    });
-    const phase1 = await executeTool(pi, "PromoteFinding", {
-      id: added.details.record.id,
-      poc_path: pocScriptPath,
-      control_path: controlScriptPath,
-      control_target: "https://control.example",
-      oob: true,
-    });
-    expect(phase1.isError).toBe(true);
-    expect(phase1.content[0].text).toContain("PI_OOB_ORACLE_URL");
-    expect(phase1.details.record.pendingConfirmation).toBeUndefined();
-  });
-
-  test("PromoteFinding oob:true records an honest oracle differential (target token only)", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    // Mock operator oracle: first-provisioned token = target run; the TARGET
-    // (and only the target) causes one interaction with it.
-    const provisioned: string[] = [];
-    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
-      const u = new URL(url);
-      if (u.pathname === "/provision") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
-        provisioned.push(body.token);
-        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
-      }
-      if (u.pathname === "/interactions") {
-        const token = u.searchParams.get("token") ?? "";
-        const hits = token === provisioned[0] && !token.includes(provisioned[1] ?? "") ? 1 : 0;
-        const interactions = hits
-          ? [{ protocol: "dns", src_ip: "203.0.113.7", ts: new Date().toISOString(), raw: "" }]
-          : [];
-        return new Response(JSON.stringify({ interactions }), { status: 200 });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
-    process.env.PI_OOB_SOURCE_SEPARATED = "1";
-    process.env.PI_OOB_POLL_MS = "600";
-    process.env.PI_OOB_INTERVAL_MS = "100";
-    process.env.PI_OOB_SETTLE_MS = "250";
-    try {
-      const added = await addCase(pi, {
-        title: "Blind SSRF honest",
-        status: "investigating",
-        evidence: "URL param fetched server-side",
-        confidence: "high",
-        severity: "high",
-        poc: "make target fetch callback domain",
-        impact: "internal fetch",
-        target: "oob-app",
-      });
-      const phase1 = await executeTool(pi, "PromoteFinding", {
-        id: added.details.record.id,
-        poc_path: pocScriptPath,
-        oob: true,
-      });
-      expect(phase1.isError).toBeUndefined();
-      const bundle = phase1.details.record.pendingConfirmation;
-      expect(bundle).toBeDefined();
-      expect(bundle.callbackVerified.attempted).toBe(true);
-      expect(bundle.callbackVerified.targetHits).toBe(1);
-      expect(bundle.callbackVerified.controlHits).toBe(0);
-      expect(bundle.callbackVerified.sourceSeparated).toBe(true);
-
-      // Phase 2 must NOT require a control target for OOB-only bundles — it
-      // re-polls the oracle freshly and commits on the same differential.
-      const confirm = await executeTool(pi, "ConfirmFinding", {
-        id: added.details.record.id,
-        verdict: {
-          verdict: "CONFIRMED",
-          reasoning: "oracle saw the target token only under attested source separation",
-          evidence_reviewed: ["poc"],
-          differential: "target_only",
-          re_execution_note: "fresh harness re-poll observed the same target-only differential",
-          disconfirmation_attempt:
-            "serial baseline and patched-control reasoning both fail to explain the callback",
-          canary_assessment: "not_applicable",
-          canary_reason: "the per-run OOB token IS the causality signal here",
-          panel_override_note: "test: panel not provisioned",
-        },
-      });
-      expect(confirm.details.promoted).toBe(true);
-    } finally {
-      delete process.env.PI_OOB_ORACLE_URL;
-      delete process.env.PI_OOB_SOURCE_SEPARATED;
-      delete process.env.PI_OOB_POLL_MS;
-      delete process.env.PI_OOB_INTERVAL_MS;
-      delete process.env.PI_OOB_SETTLE_MS;
-      setOobOracleFetchForTest(undefined);
-    }
-  });
-
-  test("PromoteFinding stores panel_votes; quorum unlocks CONFIRMED without an override note", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-
-    const added = await addCase(pi, {
-      title: "Panel quorum case",
-      status: "investigating",
-      evidence: "observed reflection",
-      confidence: "high",
-      severity: "high",
-      poc: "send payload",
-      impact: "script execution",
-      target: "panel.test",
-    });
-    const id = added.details.record.id;
-
-    const phase1 = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      control_path: controlScriptPath,
-      local: true,
-      panel_votes: [
-        { verdict: "exploit", rationale: "reproduced independently", model: "panel-a" },
-        { verdict: "exploit", rationale: "differential is sound", model: "panel-b" },
-        { verdict: "not_exploit", rationale: "looks intended", model: "panel-c" },
-      ],
-    });
-    const bundle = phase1.details.record.pendingConfirmation;
-    expect(bundle.panelVotes).toHaveLength(3);
-    expect(
-      bundle.panelVotes.filter((v: { verdict: string }) => v.verdict === "exploit"),
-    ).toHaveLength(2);
-
-    // Quorum (2/3 exploit) → CONFIRMED needs NO override note.
-    const confirm = await executeTool(pi, "ConfirmFinding", {
-      id,
-      verdict: {
-        verdict: "CONFIRMED",
-        reasoning: "target-only differential reproduced on fresh replay",
-        evidence_reviewed: ["evidence.json"],
-        re_execution_note: "matched target only",
-        differential: "target_only",
-        disconfirmation_attempt: "patched replica showed nothing",
-        canary_assessment: "not_applicable",
-        canary_reason: "no attacker-reflected field",
-      },
-    });
-    expect(confirm.details.promoted).toBe(true);
-  });
-
-  test("PromoteFinding rejects malformed panel_votes before running anything", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-
-    const added = await addCase(pi, {
-      title: "Bad panel case",
-      status: "investigating",
-      evidence: "observed",
-      confidence: "high",
-      severity: "high",
-      poc: "send payload",
-      impact: "impact",
-      target: "bad-panel.test",
-    });
-    // executeTool converts PromoteFinding failures into isError results.
-    const result = await executeTool(pi, "PromoteFinding", {
-      id: added.details.record.id,
-      poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      control_path: controlScriptPath,
-      local: true,
-      panel_votes: [{ verdict: "explode" as unknown as string, rationale: "x", model: "m" }],
-    });
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Invalid panel_votes");
-    // Nothing ran: no pending bundle was recorded.
-    expect(result.details?.record?.pendingConfirmation).toBeUndefined();
   });
 
   test("retry_policy is settable via CaseUpdate and surfaced by CaseGet", async () => {
@@ -690,344 +473,56 @@ describe("casefile extension", () => {
     expect(coverageEvents).toHaveLength(2);
   });
 
-  test("PromoteFinding oob:true rejects a bundle whose control token also fired", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    // Cheating topology: BOTH tokens receive interactions — not target-dependent.
-    const provisioned: string[] = [];
-    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
-      const u = new URL(url);
-      if (u.pathname === "/provision") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
-        provisioned.push(body.token);
-        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
-      }
-      if (u.pathname === "/interactions") {
-        return new Response(
-          JSON.stringify({
-            interactions: [{ protocol: "dns", src_ip: "203.0.113.7", ts: "", raw: "" }],
-          }),
-          { status: 200 },
-        );
-      }
-      return new Response("not found", { status: 404 });
-    });
-    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
-    process.env.PI_OOB_SOURCE_SEPARATED = "1";
-    process.env.PI_OOB_POLL_MS = "600";
-    process.env.PI_OOB_INTERVAL_MS = "100";
-    process.env.PI_OOB_SETTLE_MS = "250";
-    try {
-      const added = await addCase(pi, {
-        title: "Cheating callback",
-        status: "investigating",
-        evidence: "suspected SSRF",
-        confidence: "high",
-        severity: "high",
-        poc: "curl callback unconditionally",
-        impact: "internal fetch",
-        target: "oob-app",
-      });
-      const phase1 = await executeTool(pi, "PromoteFinding", {
-        id: added.details.record.id,
-        poc_path: pocScriptPath,
-        oob: true,
-      });
-      // The gate rejects at store time: control-token interactions mean the
-      // callback is not target-dependent.
-      expect(phase1.isError).toBe(true);
-      expect(phase1.content[0].text).toContain("OOB VERIFY FAILED");
-      expect(phase1.content[0].text).toContain("not target-dependent");
-      expect(phase1.details.record.pendingConfirmation).toBeUndefined();
-    } finally {
-      for (const k of [
-        "PI_OOB_ORACLE_URL",
-        "PI_OOB_SOURCE_SEPARATED",
-        "PI_OOB_POLL_MS",
-        "PI_OOB_INTERVAL_MS",
-        "PI_OOB_SETTLE_MS",
-      ])
-        delete process.env[k];
-      setOobOracleFetchForTest(undefined);
-    }
-  });
-
-  test("OOB polling keeps watching after the first hit so delayed control hits are caught", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    let pollCount = 0;
-    const provisioned: string[] = [];
-    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
-      const u = new URL(url);
-      if (u.pathname === "/provision") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
-        provisioned.push(body.token);
-        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
-      }
-      if (u.pathname === "/interactions") {
-        pollCount += 1;
-        const token = u.searchParams.get("token") ?? "";
-        // Target token fires immediately; the CONTROL token only fires on a
-        // LATER poll — an early break would miss it and pass a cheater.
-        if (token === provisioned[0]) {
-          return new Response(
-            JSON.stringify({ interactions: [{ protocol: "dns", src_ip: "203.0.113.7" }] }),
-            { status: 200 },
-          );
-        }
-        const lateControl = pollCount >= 4;
-        return new Response(
-          JSON.stringify({
-            interactions: lateControl ? [{ protocol: "dns", src_ip: "203.0.113.9" }] : [],
-          }),
-          { status: 200 },
-        );
-      }
-      return new Response("not found", { status: 404 });
-    });
-    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
-    process.env.PI_OOB_SOURCE_SEPARATED = "1";
-    process.env.PI_OOB_POLL_MS = "5000";
-    process.env.PI_OOB_INTERVAL_MS = "100";
-    process.env.PI_OOB_SETTLE_MS = "800";
-    try {
-      const added = await addCase(pi, {
-        title: "Late control hit",
-        status: "investigating",
-        evidence: "suspected SSRF",
-        confidence: "high",
-        severity: "high",
-        poc: "trigger",
-        impact: "fetch",
-        target: "oob-app",
-      });
-      const phase1 = await executeTool(pi, "PromoteFinding", {
-        id: added.details.record.id,
-        poc_path: pocScriptPath,
-        oob: true,
-      });
-      expect(phase1.isError).toBe(true);
-      expect(phase1.content[0].text).toContain("not target-dependent");
-    } finally {
-      for (const k of [
-        "PI_OOB_ORACLE_URL",
-        "PI_OOB_SOURCE_SEPARATED",
-        "PI_OOB_POLL_MS",
-        "PI_OOB_INTERVAL_MS",
-        "PI_OOB_SETTLE_MS",
-      ])
-        delete process.env[k];
-      setOobOracleFetchForTest(undefined);
-    }
-  }, 10_000);
-
-  test("unattributed interactions (missing src_ip) never count as target hits", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    const provisioned: string[] = [];
-    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
-      const u = new URL(url);
-      if (u.pathname === "/provision") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
-        provisioned.push(body.token);
-        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
-      }
-      if (u.pathname === "/interactions") {
-        const token = u.searchParams.get("token") ?? "";
-        // A fabricated-looking interaction with NO src_ip must be rejected.
-        const interactions =
-          token === provisioned[0] ? [{ protocol: "http", raw: "fabricated?" }] : [];
-        return new Response(JSON.stringify({ interactions }), { status: 200 });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
-    process.env.PI_OOB_SOURCE_SEPARATED = "1";
-    process.env.PI_OOB_POLL_MS = "600";
-    process.env.PI_OOB_INTERVAL_MS = "100";
-    process.env.PI_OOB_SETTLE_MS = "250";
-    try {
-      const added = await addCase(pi, {
-        title: "Unattributed callback",
-        status: "investigating",
-        evidence: "suspected SSRF",
-        confidence: "high",
-        severity: "high",
-        poc: "trigger",
-        impact: "fetch",
-        target: "oob-app",
-      });
-      const phase1 = await executeTool(pi, "PromoteFinding", {
-        id: added.details.record.id,
-        poc_path: pocScriptPath,
-        oob: true,
-      });
-      expect(phase1.isError).toBe(true);
-      expect(phase1.content[0].text).toContain("no interaction with the target-run callback token");
-    } finally {
-      for (const k of [
-        "PI_OOB_ORACLE_URL",
-        "PI_OOB_SOURCE_SEPARATED",
-        "PI_OOB_POLL_MS",
-        "PI_OOB_INTERVAL_MS",
-        "PI_OOB_SETTLE_MS",
-      ])
-        delete process.env[k];
-      setOobOracleFetchForTest(undefined);
-    }
-  });
-
-  test("mode:'intra_target' combined with oob:true is rejected", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
-    try {
-      const added = await addCase(pi, {
-        title: "Intra OOB conflict",
-        status: "investigating",
-        evidence: "x",
-        confidence: "high",
-        severity: "high",
-        poc: "p",
-        impact: "i",
-        target: "oob-app",
-      });
-      const phase1 = await executeTool(pi, "PromoteFinding", {
-        id: added.details.record.id,
-        poc_path: pocScriptPath,
-        mode: "intra_target",
-        oob: true,
-      });
-      expect(phase1.isError).toBe(true);
-      expect(phase1.content[0].text).toContain("cannot be combined with oob:true");
-    } finally {
-      delete process.env.PI_OOB_ORACLE_URL;
-    }
-  });
-
-  test("oob:true + reflection canary in evidence is rejected with a clear message", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    // Oracle configured so the run gets past provisioning; the canary lives
-    // in the PoC's evidence.json, so rejection happens after run 1.
-    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
-      const u = new URL(url);
-      if (u.pathname === "/provision") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
-        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
-      }
-      return new Response(JSON.stringify({ interactions: [] }), { status: 200 });
-    });
-    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
-    try {
-      const added = await addCase(pi, {
-        title: "Canary plus OOB",
-        status: "investigating",
-        evidence: "x",
-        confidence: "high",
-        severity: "high",
-        poc: "p",
-        impact: "i",
-        target: "oob-app",
-      });
-      // PoC whose evidence declares a reflection canary.
-      const canaryPoc = join(tempDir, "canary-oob.sh");
-      writeFileSync(
-        canaryPoc,
-        [
-          "#!/bin/sh",
-          'E="$PI_POC_EVIDENCE_DIR"',
-          'mkdir -p "$E"',
-          'printf \'{"nonce":"%s","claim":"c","verify":{"method":"GET","url":"http://oob-app/x?c={{PI_POC_CANARY}}","expect":{"status":[200],"body_contains":["resp"]},"canary":{"mode":"reflection","placeholder":"{{PI_POC_CANARY}}"}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
-          "exit 0",
-          "",
-        ].join("\n"),
-        "utf8",
-      );
-      const phase1 = await executeTool(pi, "PromoteFinding", {
-        id: added.details.record.id,
-        poc_path: canaryPoc,
-        oob: true,
-      });
-      expect(phase1.isError).toBe(true);
-      expect(phase1.content[0].text).toContain("cannot be combined with oob:true");
-      expect(phase1.details.record.pendingConfirmation).toBeUndefined();
-    } finally {
-      delete process.env.PI_OOB_ORACLE_URL;
-      setOobOracleFetchForTest(undefined);
-    }
-  });
-
-  test("PromoteFinding defaults control_path to poc_path but still requires an approved control target", async () => {
+  test("ConfirmFinding INCONCLUSIVE preserves the case for manual review (tool level)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
     const added = await addCase(pi, {
-      title: "No control path",
+      title: "Flaky auth bypass lead",
       status: "investigating",
-      evidence: "reflected input",
-      confidence: "high",
+      confidence: "medium",
       severity: "medium",
-      poc: "send payload, check reflection",
-      impact: "script execution",
-      target: "example-app",
+      target: "app.example.test",
+      endpoint: "/admin",
+      bugClass: "auth-bypass",
+      summary: "Admin panel sometimes renders without a session",
+      evidence: "two of five requests returned 200",
+      poc: "GET /admin without a session cookie, repeat x5",
+      impact: "Potential admin panel access without authentication",
     });
-    const id = added.details.record.id;
+    const record = added.details.record;
 
-    // Missing control_path is no longer ceremony: the harness defaults it to
-    // poc_path, then still runs the same-byte control branch.
-    const defaultControlPath = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      local: true,
-    });
-    expect(defaultControlPath.isError).toBeUndefined();
-    expect(defaultControlPath.details.record.status).toBe("investigating");
-    expect(defaultControlPath.details.record.pendingConfirmation.controlPath).toBe(pocScriptPath);
-
-    // control_target is still mandatory and cannot be inferred by the agent.
-    const noTargetFromDefault = await executeTool(pi, "PromoteFinding", {
-      id,
+    const phase1 = await executeTool(pi, "PromoteFinding", {
+      id: record.id,
       poc_path: pocScriptPath,
       local: true,
     });
-    expect(noTargetFromDefault.isError).toBe(true);
-    expect(noTargetFromDefault.details.missingControlTarget).toBe(true);
-    expect(noTargetFromDefault.details.record.status).toBe("investigating");
+    expect(phase1.details.record.pendingConfirmation).toBeDefined();
 
-    // control_path without control_target — blocked before any PoC run.
-    const noTarget = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: pocScriptPath,
-      control_path: controlScriptPath,
+    const verdict = await executeTool(pi, "ConfirmFinding", {
+      id: record.id,
+      verdict: {
+        verdict: "INCONCLUSIVE",
+        reasoning: "could not reproduce the 200s under the harness replay; not disproved either",
+        evidence_reviewed: [
+          "both target run transcripts",
+          "attack/baseline replay",
+          "evidence artifacts",
+        ],
+        differential: "unclear",
+        model: "test-model",
+      },
     });
-    expect(noTarget.isError).toBe(true);
-    expect(noTarget.details.missingControlTarget).toBe(true);
-    expect(noTarget.details.record.status).toBe("investigating");
-
-    // control_target equal to the case target — blocked: a control run against
-    // the vulnerable target proves nothing.
-    const sameTarget = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: pocScriptPath,
-      control_path: controlScriptPath,
-      control_target: "example-app",
-    });
-    expect(sameTarget.isError).toBe(true);
-    expect(sameTarget.details.controlTargetEqualsCase).toBe(true);
-    expect(sameTarget.details.record.status).toBe("investigating");
-
-    // A distinct but agent-invented host is not a valid control trust anchor.
-    const inventedControl = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: pocScriptPath,
-      control_path: controlScriptPath,
-      control_target: "invented-control.example",
-    });
-    expect(inventedControl.isError).toBe(true);
-    expect(inventedControl.details.controlNotAuthorized).toBe(true);
-    expect(inventedControl.details.record.status).toBe("investigating");
+    expect(verdict.isError ?? false).toBe(false);
+    expect(verdict.details.promoted).toBe(false);
+    expect(verdict.details.record.status).toBe("investigating");
+    expect(verdict.content[0].text).toContain("INCONCLUSIVE");
+    // Preserved, not dropped: the pending bundle is consumed but the case
+    // stays open with a manual-review note.
+    expect(verdict.details.record.pendingConfirmation).toBeUndefined();
+    expect(
+      verdict.details.record.assumptions?.some((a: string) => a.includes("INCONCLUSIVE")),
+    ).toBe(true);
   });
 
   test("PromoteFinding rejects a PoC that exits 0 but writes no evidence.json", async () => {
@@ -1054,146 +549,6 @@ describe("casefile extension", () => {
     const result = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: noEvidence,
-      control_target: "https://control.example",
-      control_path: noEvidence,
-      local: true,
-    });
-    expect(result.isError).toBe(true);
-    expect(result.details.evidenceFailed).toBe(true);
-    expect(result.details.record.status).toBe("investigating");
-  });
-
-  test("PromoteFinding blocks a control run whose evidence matches the target's (cheat)", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-
-    const added = await addCase(pi, {
-      title: "Cheating PoC",
-      status: "investigating",
-      evidence: "reflected input",
-      confidence: "high",
-      severity: "medium",
-      poc: "send payload, check reflection",
-      impact: "script execution",
-      target: "example-app",
-    });
-    const id = added.details.record.id;
-
-    // The control script is the SAME file as the PoC (same-file contract) but
-    // its control branch writes the SAME evidence as the target branch — the
-    // way a cheating PoC claims success regardless of target behavior. The
-    // machine differential must block the promotion.
-    const cheatScript = join(tempDir, "cheat.sh");
-    writeFileSync(
-      cheatScript,
-      [
-        "#!/bin/sh",
-        'E="$PI_POC_EVIDENCE_DIR"',
-        'mkdir -p "$E"',
-        // Hardcoded URL + claim in BOTH modes: the control run's evidence is
-        // byte-identical to the target's (modulo nonce), so the machine
-        // differential must block the promotion.
-        'printf \'{"nonce":"%s","claim":"read /etc/passwd","verify":{"method":"GET","url":"http://victim/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root:"]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
-        "exit 0",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-
-    const result = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: cheatScript,
-      control_target: "https://control.example",
-      control_path: cheatScript,
-      local: true,
-    });
-    expect(result.isError).toBe(true);
-    expect(result.details.controlIdentical).toBe(true);
-    expect(result.details.record.status).toBe("investigating");
-  });
-
-  test("PromoteFinding blocks a control script that crashes before running (no completion)", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-
-    const added = await addCase(pi, {
-      title: "Crashing control",
-      status: "investigating",
-      evidence: "reflected input",
-      confidence: "high",
-      severity: "medium",
-      poc: "send payload, check reflection",
-      impact: "script execution",
-      target: "example-app",
-    });
-    const id = added.details.record.id;
-
-    // A control script that kills itself never runs to completion — the gate
-    // must NOT treat a crash as a clean control verdict. The poc branch still
-    // writes valid evidence (so the failure is the CONTROL completion, not the
-    // poc evidence contract). Same-file contract: poc and control are the SAME
-    // script.
-    const crashControl = join(tempDir, "crash-control.sh");
-    writeFileSync(
-      crashControl,
-      [
-        "#!/bin/sh",
-        'E="$PI_POC_EVIDENCE_DIR"',
-        'mkdir -p "$E"',
-        'if [ "$PI_POC_MODE" = "control" ]; then',
-        "  kill -9 $$",
-        "fi",
-        'printf \'{"nonce":"%s","claim":"read /etc/passwd","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root:"]}\' "$PI_POC_NONCE" "$PI_POC_TARGET" > "$E/evidence.json"',
-        "exit 0",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-
-    const result = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: crashControl,
-      control_target: "https://control.example",
-      control_path: crashControl,
-      local: true,
-    });
-    expect(result.isError).toBe(true);
-    expect(result.details.didNotComplete).toBe(true);
-    expect(result.details.record.status).toBe("investigating");
-  });
-
-  test("PromoteFinding blocks a control that completes but writes no evidence", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-
-    const added = await addCase(pi, {
-      title: "Dead control",
-      status: "investigating",
-      evidence: "reflected input",
-      confidence: "high",
-      severity: "medium",
-      poc: "send payload, check reflection",
-      impact: "script execution",
-      target: "example-app",
-    });
-    const id = added.details.record.id;
-
-    // The control exits cleanly — but it never writes evidence.json, so it
-    // never demonstrates anything about the control target. A "control" that
-    // completes without a verdict is not a clean verdict. Same-file contract:
-    // poc and control are the SAME script (the poc branch also writes nothing).
-    const deadControl = join(tempDir, "dead-control.sh");
-    writeFileSync(
-      deadControl,
-      '#!/bin/sh\nif [ "$PI_POC_MODE" = "control" ]; then\n  exit 0\nfi\nprintf \'ok\'',
-      "utf8",
-    );
-
-    const result = await executeTool(pi, "PromoteFinding", {
-      id,
-      poc_path: deadControl,
-      control_target: "https://control.example",
-      control_path: deadControl,
       local: true,
     });
     expect(result.isError).toBe(true);
@@ -1219,15 +574,12 @@ describe("casefile extension", () => {
 
     const completeVerdict = {
       verdict: "CONFIRMED",
-      reasoning: "re-sent the verify request: effect reproduced on target only",
+      reasoning: "reviewed the runs: effect reproduced on the attack request only",
       evidence_reviewed: ["evidence.json (target run)"],
-      re_execution_note: "fresh harness replay matched only the target",
+      re_execution_note: "attack request matched; same-host baseline did not",
       differential: "target_only",
       disconfirmation_attempt: "tried a patched replica and a second account — no effect",
-      canary_assessment: "not_applicable",
-      canary_reason: "the fixture response has no attacker-reflected field",
       model: "test-model",
-      panel_override_note: "test: panel not provisioned",
     };
 
     // No pending bundle (PromoteFinding never ran) → the verdict cannot apply.
@@ -1244,8 +596,6 @@ describe("casefile extension", () => {
     const phase1 = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      control_path: controlScriptPath,
       local: true,
     });
     expect(phase1.details?.record?.status).toBe("investigating");
@@ -1255,8 +605,6 @@ describe("casefile extension", () => {
     const workerPromote = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      control_path: controlScriptPath,
       local: true,
     });
     expect(workerPromote.isError).toBe(true);
@@ -1285,27 +633,6 @@ describe("casefile extension", () => {
     }
     expect(badVerdictErr).toBeDefined();
     expect(badVerdictErr!.message).toContain("re_execution_note");
-
-    // Phase 2 is not a caller-supplied checkbox: ConfirmFinding performs a
-    // fresh harness replay and fails closed if the control is inconclusive.
-    setHarnessFetchForTest(async (input: string | URL) => {
-      const url = new URL(String(input));
-      if (url.hostname.includes("control")) throw new Error("control unavailable");
-      return new Response("root:x:0:0:root:/root:/bin/sh", { status: 200 });
-    });
-    let replayErr: Error | undefined;
-    try {
-      await executeTool(pi, "ConfirmFinding", { id, verdict: completeVerdict });
-    } catch (e) {
-      replayErr = e as Error;
-    } finally {
-      setHarnessFetchForTest(
-        globalThis.fetch as unknown as (input: string | URL) => Promise<Response>,
-      );
-    }
-    expect(replayErr).toBeDefined();
-    expect(replayErr!.message).toContain("MAIN-AGENT REPLAY FAILED");
-    expect(getCaseById(id)?.status).toBe("investigating");
 
     // A complete verdict commits.
     const confirmed = await executeTool(pi, "ConfirmFinding", {
@@ -1356,8 +683,6 @@ describe("casefile extension", () => {
     const result = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: staleNonce,
-      control_target: "https://control.example",
-      control_path: staleNonce,
       local: true,
     });
     expect(result.isError).toBe(true);
@@ -1586,23 +911,18 @@ describe("casefile extension", () => {
       await executeTool(pi, "PromoteFinding", {
         id: reported.details.record.id,
         poc_path: pocScriptPath,
-        control_target: "https://control.example",
-        control_path: controlScriptPath,
         local: true,
       });
       await executeTool(pi, "ConfirmFinding", {
         id: reported.details.record.id,
         verdict: {
           verdict: "CONFIRMED",
-          reasoning: "re-sent the verify request: effect reproduced on target only",
+          reasoning: "reviewed the runs: effect reproduced on the attack request only",
           evidence_reviewed: ["evidence.json (target run)"],
-          re_execution_note: "fresh harness replay matched only the target",
+          re_execution_note: "attack request matched; same-host baseline did not",
           differential: "target_only",
           disconfirmation_attempt: "tried a patched replica — no effect; target-dependent",
-          canary_assessment: "not_applicable",
-          canary_reason: "the fixture response has no attacker-reflected field",
           model: "test-model",
-          panel_override_note: "test: panel not provisioned",
         },
       });
       const ctxResult = await executeTool(pi, "CaseContext", { id: reported.details.record.id });
@@ -1760,23 +1080,18 @@ describe("casefile extension", () => {
     await executeTool(pi, "PromoteFinding", {
       id: storedXss.details.record.id,
       poc_path: pocScriptPath,
-      control_target: "https://control.example",
-      control_path: controlScriptPath,
       local: true,
     });
     await executeTool(pi, "ConfirmFinding", {
       id: storedXss.details.record.id,
       verdict: {
         verdict: "CONFIRMED",
-        reasoning: "re-sent the verify request: payload rendered on target only",
+        reasoning: "reviewed the runs: payload rendered on the attack request only",
         evidence_reviewed: ["evidence.json (target run)"],
-        re_execution_note: "fresh harness replay matched only the target",
+        re_execution_note: "attack request matched; same-host baseline did not",
         differential: "target_only",
         disconfirmation_attempt: "rendered a control note without script — no execution",
-        canary_assessment: "not_applicable",
-        canary_reason: "legacy fixture has no canary placeholder",
         model: "test-model",
-        panel_override_note: "test: panel not provisioned",
       },
     });
 

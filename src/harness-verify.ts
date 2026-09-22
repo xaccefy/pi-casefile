@@ -1,60 +1,47 @@
 /**
- * Harness-side target/control replay — Tier 2 of docs/poc-trust-model.md.
+ * Harness-side attack/baseline replay.
  *
  * The machine floor cannot trust a caller's self-reported `re_executed`
  * boolean. This module makes the HARNESS re-send the evidence's `verify`
- * request with its own HTTP client and apply the same `expect` predicates
- * (status / body_contains / body_regex) to target and control responses. The
- * main agent supplies the predicate; the harness owns both evidence acquisition
- * and predicate execution before the later semantic review.
+ * (attack) request and the evidence's `baseline` (legitimate) request with
+ * its own HTTP client, applying the attack's `expect` predicates to BOTH
+ * responses. The main agent supplies the predicate and the baseline; the
+ * harness owns evidence acquisition and predicate execution before the later
+ * semantic review.
  *
  * Policy:
  * - Private/internal hosts require explicit operator authorization; otherwise
  *   replay fails closed.
  * - Redirects are manual and every hop is checked before it is fetched.
- * - Target must match while the identical control request must not.
+ * - The attack request must match while the baseline request must not.
  *
  * Undici's custom dispatcher pins the approved DNS result through connect;
  * node:dns and node:net provide resolution and address classification.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Worker } from "node:worker_threads";
 import { isPublicIpAddress } from "@xaccefy/pi-shared";
 import { Agent, fetch as undiciFetch } from "undici";
-import { POC_CANARY_PLACEHOLDER, type PoCEvidence, type VerifyExpect } from "./evidence.ts";
+import type { PoCEvidence, VerifyExpect } from "./evidence.ts";
 
 // Public re-export makes the single-source classifier identity testable across
 // the web tool and confirmation replay paths.
 export { isPublicIpAddress } from "@xaccefy/pi-shared";
 
 export type HarnessVerifyResult = {
-  /** true = the harness sent both target and control requests and judged them. */
+  /** true = the harness sent both attack and baseline requests and judged them. */
   attempted: boolean;
-  /** Present when attempted: target matched and control did not. */
+  /** Present when attempted: attack matched and baseline did not. */
   pass?: boolean;
   /** Backward-compatible target status summary. */
   status?: number;
-  /** Machine-observed target/control response summaries. */
+  /** Machine-observed attack/baseline response summaries. */
   target?: HarnessResponseObservation;
   control?: HarnessResponseObservation;
   differential?: "target_only" | "both" | "control_only" | "neither";
-  /** Independent harness-generated reflection signal, when the template supports one. */
-  canary?: HarnessCanaryResult;
-  /** Honest machine claim: predicates alone, or predicates plus a causal canary. */
-  proofStrength?: "predicate_differential" | "canary_differential";
-  note: string;
-};
-
-export type HarnessCanaryResult = {
-  mode: "reflection";
-  attempted: boolean;
-  pass?: boolean;
-  tokenSha256: string;
-  targetObserved?: boolean;
-  controlObserved?: boolean;
   note: string;
 };
 
@@ -65,7 +52,6 @@ export type HarnessResponseObservation = {
   url: string;
   bodySha256?: string;
   bodyBytes?: number;
-  canaryObserved?: boolean;
   note: string;
 };
 
@@ -120,38 +106,6 @@ function effectivePort(url: URL): string {
   return url.port || (url.protocol === "https:" ? "443" : "80");
 }
 
-function sameTargetIdentity(left: string, right: string): boolean {
-  const a = parseNetworkTarget(left);
-  const b = parseNetworkTarget(right);
-  if (!a || !b) return false;
-  if (normHost(a.url.hostname) !== normHost(b.url.hostname)) {
-    return false;
-  }
-  if ((a.url.port || b.url.port) && effectivePort(a.url) !== effectivePort(b.url)) return false;
-  return !(a.explicitProtocol && b.explicitProtocol && a.url.protocol !== b.url.protocol);
-}
-
-/**
- * A control is a trust anchor, not an agent invention. The operator supplies
- * an allowlist of approved control origins/hosts through the process env.
- */
-export function controlTargetAuthorizationError(
-  controlTarget: string,
-  allowedRaw: string | undefined = process.env.PI_POC_CONTROL_TARGETS,
-): string | undefined {
-  const allowed = (allowedRaw ?? "")
-    .split(/[,\n]/)
-    .map((value) => value.trim())
-    .filter(Boolean);
-  if (allowed.length === 0) {
-    return "no operator-approved controls are configured in PI_POC_CONTROL_TARGETS";
-  }
-  if (!allowed.some((candidate) => sameTargetIdentity(candidate, controlTarget))) {
-    return `control target ${controlTarget} is not present in the operator-approved PI_POC_CONTROL_TARGETS allowlist`;
-  }
-  return;
-}
-
 /**
  * Bind a model-authored verify URL to the target the harness actually ran.
  * A bare target permits either HTTP scheme; an explicit target URL binds the
@@ -181,16 +135,6 @@ export function verifyUrlBindingError(verifyUrl: string, target: string): string
     return `verify.url protocol ${observed.protocol} does not match run target protocol ${declared.url.protocol}`;
   }
   return;
-}
-
-function controlUrlFor(targetVerifyUrl: string, controlTarget: string): URL | undefined {
-  const control = parseNetworkTarget(controlTarget);
-  if (!control) return;
-  const target = new URL(targetVerifyUrl);
-  const url = new URL(control.url.origin);
-  url.pathname = target.pathname;
-  url.search = target.search;
-  return url;
 }
 
 // ── Predicate evaluation ──────────────────────────────────────────────
@@ -356,7 +300,6 @@ async function fetchPinned(
 async function replayRequest(
   verify: PoCEvidence["verify"],
   expect: VerifyExpect,
-  canaryToken?: string,
   opts?: ReplayOptions,
 ): Promise<HarnessResponseObservation> {
   let url: URL;
@@ -369,8 +312,6 @@ async function replayRequest(
       note: `verify.url unparseable (${verify.url})`,
     };
   }
-  const observedUrl = () =>
-    canaryToken ? url.toString().replaceAll(canaryToken, POC_CANARY_PLACEHOLDER) : url.toString();
   if (!(url.protocol === "http:" || url.protocol === "https:")) {
     return { attempted: false, url: verify.url, note: `verify.url protocol ${url.protocol}` };
   }
@@ -383,7 +324,7 @@ async function replayRequest(
   } catch (error) {
     return {
       attempted: false,
-      url: observedUrl(),
+      url: verify.url,
       note: `verify.headers invalid: ${(error as Error).message}`,
     };
   }
@@ -398,7 +339,7 @@ async function replayRequest(
     if (!opts?.allowPrivate && localName) {
       return {
         attempted: false,
-        url: observedUrl(),
+        url: url.toString(),
         note: `${url.hostname} is a private/internal host; operator authorization is required for harness replay`,
       };
     }
@@ -409,14 +350,14 @@ async function replayRequest(
       } catch (error) {
         return {
           attempted: true,
-          url: observedUrl(),
+          url: url.toString(),
           note: `request errored (DNS): ${(error as Error).message}`,
         };
       }
       if (addresses.length === 0) {
         return {
           attempted: true,
-          url: observedUrl(),
+          url: url.toString(),
           note: `request errored (DNS): ${url.hostname} resolved to no addresses`,
         };
       }
@@ -429,7 +370,7 @@ async function replayRequest(
     if (!opts?.allowPrivate && addresses.some((address) => !isPublicIpAddress(address.address))) {
       return {
         attempted: false,
-        url: observedUrl(),
+        url: url.toString(),
         note: `${url.hostname} is a private/internal host; operator authorization is required for harness replay`,
       };
     }
@@ -457,7 +398,7 @@ async function replayRequest(
           return {
             attempted: true,
             status: res.status,
-            url: observedUrl(),
+            url: url.toString(),
             note: `redirect limit exceeded (${MAX_REDIRECTS})`,
           };
         }
@@ -469,7 +410,7 @@ async function replayRequest(
           return {
             attempted: true,
             status: res.status,
-            url: observedUrl(),
+            url: url.toString(),
             note: `redirected to disallowed protocol ${next.protocol}`,
           };
         }
@@ -480,7 +421,7 @@ async function replayRequest(
           return {
             attempted: true,
             status: res.status,
-            url: observedUrl(),
+            url: url.toString(),
             note: `redirect left the bound host (${url.hostname} -> ${next.hostname})`,
           };
         }
@@ -512,22 +453,20 @@ async function replayRequest(
         return {
           attempted: true,
           status: res.status,
-          url: observedUrl(),
+          url: url.toString(),
           bodySha256: observed.sha256,
           bodyBytes: observed.bytes,
           note: "response body exceeded the 2 MiB capture limit; matcher result is inconclusive",
         };
       }
       const failures = await evaluateExpect(expect, res.status, observed.text);
-      const canaryObserved = canaryToken ? observed.text.includes(canaryToken) : undefined;
       return {
         attempted: true,
         matched: failures.length === 0,
         status: res.status,
-        url: observedUrl(),
+        url: url.toString(),
         bodySha256: observed.sha256,
         bodyBytes: observed.bytes,
-        canaryObserved,
         note:
           failures.length === 0
             ? `status ${res.status}, all predicates matched`
@@ -537,13 +476,13 @@ async function replayRequest(
       await closeFetched?.().catch(() => undefined);
       return {
         attempted: true,
-        url: observedUrl(),
+        url: url.toString(),
         note: `request errored (DNS/TLS/timeout): ${(e as Error).message}`,
       };
     }
   }
 
-  return { attempted: true, url: observedUrl(), note: "unreachable redirect state" };
+  return { attempted: true, url: url.toString(), note: "unreachable redirect state" };
 }
 
 /**
@@ -569,58 +508,14 @@ export function sameRequest(
   );
 }
 
-function injectCanary(
-  verify: PoCEvidence["verify"],
-  token: string | undefined,
-): PoCEvidence["verify"] {
-  if (!token) return verify;
-  const replace = (value: string) => value.replace(POC_CANARY_PLACEHOLDER, token);
-  return {
-    ...verify,
-    url: replace(verify.url),
-    body: verify.body === undefined ? undefined : replace(verify.body),
-    headers:
-      verify.headers === undefined
-        ? undefined
-        : Object.fromEntries(
-            Object.entries(verify.headers).map(([key, value]) => [key, replace(value)]),
-          ),
-  };
-}
-
-function canaryResult(
-  token: string | undefined,
-  target: HarnessResponseObservation,
-  control?: HarnessResponseObservation,
-): HarnessCanaryResult | undefined {
-  if (!token) return;
-  const attempted =
-    target.canaryObserved !== undefined && (control ? control.canaryObserved !== undefined : true);
-  const pass = control
-    ? attempted && target.canaryObserved === true && control.canaryObserved === false
-    : attempted && target.canaryObserved === true;
-  return {
-    mode: "reflection",
-    attempted,
-    pass,
-    tokenSha256: createHash("sha256").update(token).digest("hex"),
-    targetObserved: target.canaryObserved,
-    controlObserved: control?.canaryObserved,
-    note: control
-      ? `canary ${pass ? "target-only" : "failed"}: target=${String(target.canaryObserved)}, control=${String(control.canaryObserved)}`
-      : `canary ${pass ? "observed" : "not observed"} on target`,
-  };
-}
-
 /**
  * Combine the two observations into the differential verdict. Shared by the
- * inter-host (target vs control host) and intra-target (attack vs same-host
- * baseline) replays — only the note labels differ.
+ * attack-vs-baseline replay: "target" is the attack request, "control" the
+ * legitimate baseline request.
  */
 function judgeDifferential(
   target: HarnessResponseObservation,
   control: HarnessResponseObservation,
-  token: string | undefined,
   label: { kind: string; a: string; b: string },
 ): HarnessVerifyResult {
   const attempted = target.attempted && control.attempted;
@@ -634,12 +529,7 @@ function judgeDifferential(
         ? "control_only"
         : "neither"
     : undefined;
-  const canary = canaryResult(token, target, control);
-  const pass =
-    attempted &&
-    conclusive &&
-    differential === "target_only" &&
-    (canary === undefined || canary.pass === true);
+  const pass = attempted && conclusive && differential === "target_only";
   return {
     attempted,
     pass,
@@ -647,72 +537,16 @@ function judgeDifferential(
     target,
     control,
     differential,
-    canary,
-    proofStrength: canary?.pass ? "canary_differential" : "predicate_differential",
     note:
       `harness ${label.kind} ${differential ?? "inconclusive"}: ${label.a} (${target.note}); ` +
-      `${label.b} (${control.note})${canary ? `; ${canary.note}` : ""}`,
+      `${label.b} (${control.note})`,
   };
 }
 
 /**
- * Execute one harness-owned request template against both the case target and
- * a distinct control origin. The PoC cannot weaken the control request: the
- * harness preserves method, path, query, headers, body, and target predicates,
- * changing only the origin to the declared control target.
- */
-export async function replayDifferential(
-  evidence: PoCEvidence,
-  caseTarget: string,
-  controlTarget: string,
-  opts?: ReplayOptions,
-): Promise<HarnessVerifyResult> {
-  const bindingError = verifyUrlBindingError(evidence.verify.url, caseTarget);
-  if (bindingError) {
-    return { attempted: false, pass: false, note: `target binding failed: ${bindingError}` };
-  }
-  if (sameTargetIdentity(caseTarget, controlTarget)) {
-    return {
-      attempted: false,
-      pass: false,
-      note: "control target resolves to the same network identity as the case target",
-    };
-  }
-  const controlUrl = controlUrlFor(evidence.verify.url, controlTarget);
-  if (!controlUrl) {
-    return {
-      attempted: false,
-      pass: false,
-      note: `control target is not an HTTP network target: ${controlTarget}`,
-    };
-  }
-
-  const token = evidence.verify.canary
-    ? `poc_canary_${randomBytes(24).toString("hex")}`
-    : undefined;
-  const targetVerify = injectCanary(evidence.verify, token);
-  const target = await replayRequest(targetVerify, targetVerify.expect, token, opts);
-  const control = await replayRequest(
-    {
-      ...targetVerify,
-      url: injectCanary({ ...evidence.verify, url: controlUrl.toString() }, token).url,
-    },
-    targetVerify.expect,
-    token,
-    opts,
-  );
-  return judgeDifferential(target, control, token, {
-    kind: "differential",
-    a: "target",
-    b: "control",
-  });
-}
-
-/**
- * Same-host differential (Tier 2, intra-target). For access-control and
- * business-logic classes the discriminating variable is the attacker's
- * identity or a request parameter, NOT the host — so the sound baseline is a
- * legitimate request to the SAME target, not the same request to another host.
+ * Same-host differential (intra-target). The discriminating variable is the
+ * attacker's identity or a request parameter, not the host — the sound
+ * baseline is a legitimate request to the SAME target.
  * The harness sends the attack request and the model-declared `evidence.baseline`
  * request to the case target, applies the attack's `verify.expect` predicates to
  * BOTH responses, and passes only when the proof appears on the attack response
@@ -749,13 +583,9 @@ export async function replayIntraTarget(
     };
   }
 
-  const token = evidence.verify.canary
-    ? `poc_canary_${randomBytes(24).toString("hex")}`
-    : undefined;
-  const attackVerify = injectCanary(evidence.verify, token);
-  const attack = await replayRequest(attackVerify, attackVerify.expect, token, opts);
+  const attack = await replayRequest(evidence.verify, evidence.verify.expect, opts);
   // The baseline carries the attack's predicates: the proof must be ABSENT here.
-  const baselineVerify = injectCanary(
+  const base = await replayRequest(
     {
       ...evidence.verify,
       method: baseline.method,
@@ -763,11 +593,11 @@ export async function replayIntraTarget(
       headers: baseline.headers,
       body: baseline.body,
     },
-    token,
+    evidence.verify.expect,
+    opts,
   );
-  const base = await replayRequest(baselineVerify, attackVerify.expect, token, opts);
 
-  return judgeDifferential(attack, base, token, {
+  return judgeDifferential(attack, base, {
     kind: "intra-target",
     a: "attack",
     b: "baseline",

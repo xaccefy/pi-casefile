@@ -97,22 +97,22 @@ describe("poc-runner", () => {
 
     const result = runPoc(shPoc, {
       local: true,
-      env: { PI_POC_MODE: "control", PI_POC_TARGET: "http://example.test" },
+      env: { PI_POC_MODE: "poc", PI_POC_TARGET: "http://example.test" },
     });
 
     expect(result.exitCode).toBe(0);
-    expect(result.output).toContain("control|http://example.test");
+    expect(result.output).toContain("poc|http://example.test");
   });
 
   it("does not leak operator env (PI_* secrets, proxy vars) into local runs", () => {
     // Local PoC scripts are untrusted agent-authored code running on the host;
     // they must see the harness env contract + PATH, never the operator's
-    // ambient process env (proxy URLs can embed credentials; PI_OOB_ORACLE_TOKEN
-    // is a bearer secret).
+    // ambient process env (proxy URLs can embed credentials; operator PI_*
+    // vars can be bearer secrets).
     const sentinel = `sentinel-${randomBytes(8).toString("hex")}`;
-    const previousToken = process.env.PI_OOB_ORACLE_TOKEN;
+    const previousToken = process.env.PI_OPERATOR_SECRET_TOKEN;
     const previousProxy = process.env.https_proxy;
-    process.env.PI_OOB_ORACLE_TOKEN = sentinel;
+    process.env.PI_OPERATOR_SECRET_TOKEN = sentinel;
     process.env.https_proxy = "http://user:leaked-pass@proxy.example:8080";
     const shPoc = join(tempDir, "poc-envdump.sh");
     writeFileSync(shPoc, "#!/bin/sh\nenv\n", "utf8");
@@ -120,18 +120,18 @@ describe("poc-runner", () => {
     try {
       const result = runPoc(shPoc, {
         local: true,
-        env: { PI_POC_MODE: "control", PI_POC_TARGET: "http://example.test" },
+        env: { PI_POC_MODE: "poc", PI_POC_TARGET: "http://example.test" },
       });
 
       // Exit 0 proves PATH still resolves the interpreter under the minimal env.
       expect(result.exitCode).toBe(0);
-      expect(result.output).toContain("PI_POC_MODE=control");
+      expect(result.output).toContain("PI_POC_MODE=poc");
       expect(result.output).toContain("PI_POC_TARGET=http://example.test");
       expect(result.output).not.toContain(sentinel);
       expect(result.output).not.toContain("leaked-pass");
     } finally {
-      if (previousToken === undefined) delete process.env.PI_OOB_ORACLE_TOKEN;
-      else process.env.PI_OOB_ORACLE_TOKEN = previousToken;
+      if (previousToken === undefined) delete process.env.PI_OPERATOR_SECRET_TOKEN;
+      else process.env.PI_OPERATOR_SECRET_TOKEN = previousToken;
       if (previousProxy === undefined) delete process.env.https_proxy;
       else process.env.https_proxy = previousProxy;
     }
@@ -142,7 +142,7 @@ describe("poc-runner", () => {
     writeFileSync(
       shPoc,
       `#!/bin/sh
-printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"http://example.test/proof","expect":{"body_contains":["target signal"]}},"observations":[]}' "$PI_POC_NONCE" > "$PI_POC_EVIDENCE_DIR/evidence.json"`,
+printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"http://example.test/proof","expect":{"body_contains":["target signal"]}},"observations":[],"baseline":{"method":"GET","url":"http://example.test/safe"}}' "$PI_POC_NONCE" > "$PI_POC_EVIDENCE_DIR/evidence.json"`,
       "utf8",
     );
 
@@ -190,7 +190,7 @@ printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"ht
     writeFileSync(
       shPoc,
       `#!/bin/sh
-printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"http://example.test/proof","expect":{"status":[200],"body_contains":["target signal"]}},"observations":[]}' "$PI_POC_NONCE" > "$PI_POC_EVIDENCE_DIR/evidence.json"`,
+printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"http://example.test/proof","expect":{"status":[200],"body_contains":["target signal"]}},"observations":[],"baseline":{"method":"GET","url":"http://example.test/safe"}}' "$PI_POC_NONCE" > "$PI_POC_EVIDENCE_DIR/evidence.json"`,
       "utf8",
     );
     const outside = mkdtempSync(join(tmpdir(), "poc-evidence-outside-"));

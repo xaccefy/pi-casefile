@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { POC_CANARY_PLACEHOLDER, type PoCEvidence, parsePoCEvidence } from "../src/evidence.ts";
+import { type PoCEvidence, parsePoCEvidence } from "../src/evidence.ts";
 
 /** Named contract type for the parser result (no ReturnType coupling). */
 type ParseResult = { ok: true; evidence: PoCEvidence } | { ok: false; error: string };
@@ -27,8 +27,6 @@ function lcg(seed: number): () => number {
   };
 }
 
-const CANARY = POC_CANARY_PLACEHOLDER;
-
 function validEvidence(): Record<string, unknown> {
   return {
     nonce: "poc_abc123",
@@ -44,6 +42,11 @@ function validEvidence(): Record<string, unknown> {
       },
     },
     observations: ["own receipt lacks flag", "foreign receipt leaks flag"],
+    baseline: {
+      method: "GET",
+      url: "https://app.target.test/order/300402/receipt",
+      headers: { authorization: "Bearer x" },
+    },
   };
 }
 
@@ -108,28 +111,8 @@ const MUTATIONS: Mutation[] = [
   { path: ["observations"], op: "replace", value: "not-an-array" },
   { path: ["observations"], op: "replace", value: Array(65).fill("o") },
   { path: ["observations"], op: "replace", value: [null] },
-  // canary placeholder count violations
-  {
-    path: ["verify"],
-    op: "replace",
-    value: {
-      method: "GET",
-      url: `https://host/${CANARY}?x=${CANARY}`,
-      expect: { body_contains: ["marker"] },
-      canary: { mode: "reflection", placeholder: CANARY },
-    },
-  },
-  {
-    path: ["verify"],
-    op: "replace",
-    value: {
-      method: "GET",
-      url: "https://host/",
-      expect: { body_contains: ["marker"] },
-      canary: { mode: "reflection", placeholder: "{{WRONG}}" },
-    },
-  },
   // baseline shape attacks
+  { path: ["baseline"], op: "delete" },
   { path: ["baseline"], op: "replace", value: "not-an-object" },
   { path: ["baseline"], op: "replace", value: { method: "GET" } },
 ];
